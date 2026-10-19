@@ -1,0 +1,6 @@
+{
+  "source_dataset": "tank/minecraft-world",
+  "target_dataset": "backup/minecraft-world",
+  "state_dir": "/var/lib/minecraft-zfs-replication",
+  "keep": 24
+}

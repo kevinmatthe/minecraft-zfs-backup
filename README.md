@@ -2,7 +2,7 @@
 
 A server-side NeoForge 1.21.1 mod coordinates live world checkpoints with a Python host agent. The mod owns backup timing and Minecraft save barriers; the host agent creates and retains local ZFS snapshots. Java 21 and Python 3.11 or newer are required.
 
-Game ticks continue while the mod waits for the snapshot acknowledgement. The save flush itself can cause a short delay. Defaults are one checkpoint per hour and 24 local recovery points. Automatic checkpoints skip intervals without player activity since the last successful checkpoint; manual checkpoints always remain available. Configure optional replication to another pool or host separately, using native TrueNAS replication or another administrator-managed task.
+Game ticks continue while the mod waits for the snapshot acknowledgement. The save flush itself can cause a short delay. Defaults are one checkpoint per hour and 24 local recovery points. Automatic checkpoints skip intervals without player activity since the last successful checkpoint; manual checkpoints always remain available. Configure optional replication to another pool or host separately, using the [optional standalone synchronization task](deploy/replication.md) or your own replication system.
 
 The game container does not need ZFS privileges, a Docker socket, or a network backup endpoint. Both processes communicate through an explicitly shared directory using expiring request IDs and atomic JSON files.
 

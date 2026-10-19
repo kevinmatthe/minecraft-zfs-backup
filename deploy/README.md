@@ -23,4 +23,6 @@ PYTHONPATH=agent python3 -m minecraft_zfs_agent --config /etc/minecraft-zfs-agen
 
 Install the server mod separately. Its mailbox path is relative to the Minecraft server directory and must refer to the same directory as the host's `mailbox_path`. The default mod directory is `.zfs-snapshot-bridge`. The mailbox directory must be writable by the game UID; host state and configuration remain administrator-owned.
 
+Replication is optional and independently configured. See [the standalone synchronization task](replication.md). After verifying its first manual run, pass `--replication-config /absolute/sync.local.json` to the installer to add a separate oneshot service and five-minute systemd timer. The TrueNAS reboot hook preserves this option. Omitting it installs only local snapshots. The replication service name is reserved; use a different `--name` for the snapshot agent.
+
 Validate with a disposable source dataset and a separate test server before adopting an existing world. Preserve an independent recovery point. The default installation requires only local snapshots. Configure optional off-pool replication separately. When replacing an existing replicated setup, disable previous console/cron orchestration only after both a real mod-requested snapshot and its independently configured replication have been verified.

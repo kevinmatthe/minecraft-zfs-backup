@@ -18,6 +18,8 @@ def systemd_quote(value):
 
 def service_name(value):
     value = value.removesuffix('.service')
+    if value=='minecraft-zfs-replication':
+        raise ValueError('minecraft-zfs-replication is reserved for the optional synchronization task')
     if not re.fullmatch(r'minecraft-zfs-[A-Za-z0-9_.-]+', value):
         raise ValueError('service name must start with minecraft-zfs- and contain only letters, digits, _, . or -')
     return value + '.service'
@@ -51,10 +53,30 @@ def render_unit(repo, config):
     ])
 
 
-def postinit_command(repo, config, name, uid, gid):
+def render_replication_units(repo, config):
+    command=' '.join(systemd_quote(value) for value in
+                     ('/usr/bin/python3',repo/'deploy/replicate.py','--config',config,'run'))
+    service='\n'.join([
+        '[Unit]','Description=Optional Minecraft ZFS replication',
+        'After=local-fs.target zfs-mount.service','','[Service]','Type=oneshot',
+        'User=root','Group=root','ExecStart='+command,'UMask=0077',
+        'NoNewPrivileges=true','TimeoutStartSec=35min','KillMode=control-group','',
+    ])
+    timer='\n'.join([
+        '[Unit]','Description=Optional independent Minecraft replication schedule',
+        '','[Timer]','OnBootSec=2min','OnUnitInactiveSec=5min',
+        'RandomizedDelaySec=15s','Unit=minecraft-zfs-replication.service',
+        '','[Install]','WantedBy=timers.target','',
+    ])
+    return service,timer
+
+
+def postinit_command(repo, config, name, uid, gid, replication_config=None):
     service_name(name)
-    return shlex.join(['/usr/bin/python3',str(repo/'deploy/install.py'),'--repo',str(repo),
-                       '--config',str(config),'--name',name,'--game-uid',str(uid),'--game-gid',str(gid)])
+    command=['/usr/bin/python3',str(repo/'deploy/install.py'),'--repo',str(repo),
+             '--config',str(config),'--name',name,'--game-uid',str(uid),'--game-gid',str(gid)]
+    if replication_config is not None:command+=['--replication-config',str(replication_config)]
+    return shlex.join(command)
 
 
 def run(*args):
@@ -69,11 +91,13 @@ def main():
     parser.add_argument('--game-uid',type=int,default=1000)
     parser.add_argument('--game-gid',type=int,default=1000)
     parser.add_argument('--truenas',action='store_true',help='Register/update a persistent TrueNAS POSTINIT command')
+    parser.add_argument('--replication-config',type=Path,help='Optional separate replication task configuration')
     parser.add_argument('--print',dest='print_only',action='store_true',help='Print unit without installing')
     args = parser.parse_args()
     repo = args.repo.resolve()
     config = args.config.resolve()
     name = service_name(args.name)
+    replication_config=args.replication_config.resolve() if args.replication_config else None
     unit = render_unit(repo,config)
     if args.print_only:
         print(unit,end=''); return
@@ -83,6 +107,11 @@ def main():
     data = json.loads(config.read_text())
     if config.stat().st_uid != 0 or config.stat().st_mode & 0o022:
         parser.error('agent configuration must be root-owned and not group/world writable')
+    if replication_config:
+        info=replication_config.lstat()
+        if not replication_config.is_file() or info.st_uid!=0 or info.st_mode & 0o022:
+            parser.error('replication configuration must be root-owned and not group/world writable')
+        if not (repo/'deploy/replicate.py').is_file():parser.error('optional replication script is missing')
     mailbox = Path(data['mailbox_path'])
     state = Path(data['state_dir'])
     for folder in (mailbox,state):
@@ -100,11 +129,17 @@ def main():
     temporary = target.with_suffix('.tmp')
     temporary.write_text(unit)
     os.replace(temporary,target)
+    if replication_config:
+        service,timer=render_replication_units(repo,replication_config)
+        for filename,contents in (('minecraft-zfs-replication.service',service),('minecraft-zfs-replication.timer',timer)):
+            target=Path('/run/systemd/system')/filename
+            temporary=target.with_suffix('.tmp');temporary.write_text(contents);os.replace(temporary,target)
     run('systemctl','daemon-reload')
     run('systemctl','restart',name)
     run('systemctl','is-active','--quiet',name)
+    if replication_config:run('systemctl','restart','minecraft-zfs-replication.timer')
     if args.truenas:
-        command = postinit_command(repo,config,args.name,args.game_uid,args.game_gid)
+        command = postinit_command(repo,config,args.name,args.game_uid,args.game_gid,replication_config)
         comment = 'Minecraft ZFS agent service: '+name
         tasks = json.loads(subprocess.check_output(['midclt','call','initshutdownscript.query'],text=True))
         existing = [task for task in tasks if task['comment']==comment]

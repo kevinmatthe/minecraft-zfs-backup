@@ -7,6 +7,7 @@ import socket
 import threading
 import time
 from urllib.parse import urlsplit
+from .audit import AuditLog, AuditUnavailable, normalize_actor
 from .protocol import APIError,MAX_MESSAGE,parse_json,object_fields,identifier
 from .zfs import OWNED
 
@@ -17,6 +18,7 @@ class AgentHTTPServer(ThreadingHTTPServer):
     request_queue_size=16
     def __init__(self,address,service,token,rollback=None,max_workers=8,read_timeout=3):
         self.service,self.token,self.rollback=service,token.encode('utf-8'),rollback
+        self.audit=AuditLog(service.config.state_dir,service.config.world_path,service.config.source_dataset)
         self.workers=threading.BoundedSemaphore(max_workers)
         self.read_timeout=read_timeout
         super().__init__(address,Handler)
@@ -78,6 +80,10 @@ class Handler(BaseHTTPRequestHandler):
             ready=self.server.service.status()['ready'];return (200 if ready else 503),dict(ready=ready)
         if not path.startswith('/v1/'):raise APIError(404,'not_found','Unknown endpoint')
         if not self.authorized():raise APIError(401,'unauthorized','Bearer token required')
+        if method=='POST' and (path=='/v1/rollbacks' or path.startswith('/v1/rollbacks/')):
+            self._rollback_attempt=True
+            if hasattr(self.server.rollback,'flush_audit'):self.server.rollback.flush_audit()
+            self._audit_request_id=self.server.audit.append('HTTP_REQUEST')
         service=self.server.service
         if method=='GET':
             if path=='/v1/status':return 200,service.status()
@@ -92,6 +98,9 @@ class Handler(BaseHTTPRequestHandler):
                 return 200,value
         if method=='POST':
             body=self.body()
+            if getattr(self,'_rollback_attempt',False):
+                if 'actor' in body and body['actor'] is None:raise APIError(400,'invalid_actor','Invalid rollback actor claim')
+                self._rollback_actor=normalize_actor(body.get('actor'))
             if path=='/v1/checkpoints':return 200,service.prepare(body)
             if path=='/v1/lifecycle':return 200,service.lifecycle(body)
             pieces=path.strip('/').split('/')
@@ -99,12 +108,18 @@ class Handler(BaseHTTPRequestHandler):
                 return 200,getattr(service,pieces[3])(pieces[2],body)
             if len(pieces)==4 and pieces[:2]==['v1','rollbacks'] and pieces[3]=='resume':
                 if self.server.rollback is None:raise APIError(503,'rollback_disabled','Crafty rollback is not configured')
-                identifier(pieces[2]);object_fields(body,set())
+                identifier(pieces[2]);object_fields(body,{'actor'} if 'actor' in body else set())
+                if 'actor' in body:
+                    normalize_actor(body['actor'])
+                    return 202,self.server.rollback.resume(pieces[2],actor=body['actor'])
                 return 202,self.server.rollback.resume(pieces[2])
             if path=='/v1/rollbacks':
                 if self.server.rollback is None:raise APIError(503,'rollback_disabled','Crafty rollback is not configured')
-                object_fields(body,{'id','snapshot'});identifier(body['id'])
+                object_fields(body,{'id','snapshot'}|({'actor'} if 'actor' in body else set()));identifier(body['id'])
                 if not isinstance(body['snapshot'],str) or not OWNED.fullmatch(body['snapshot']):raise APIError(400,'invalid_snapshot','Managed published snapshot required')
+                if 'actor' in body:
+                    normalize_actor(body['actor'])
+                    return 202,self.server.rollback.submit(body['id'],body['snapshot'],actor=body['actor'])
                 return 202,self.server.rollback.submit(body['id'],body['snapshot'])
         raise APIError(404,'not_found','Unknown endpoint')
     def handle_method(self,method):
@@ -119,6 +134,11 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as error:
             logging.error('HTTP operation failed (%s)',type(error).__name__)
             status,value=500,dict(error=dict(code='internal_error',message='Operation failed; inspect administrator state'))
+        if getattr(self,'_rollback_attempt',False) and status>=400:
+            try:self.server.audit.append('HTTP_REJECT',actor=getattr(self,'_rollback_actor',None),
+                                         request_event_id=getattr(self,'_audit_request_id',None),error=value['error'])
+            except AuditUnavailable as error:
+                status,value=error.status,dict(error=dict(code=error.code,message=error.message))
         try:self.reply(status,value)
         except (BrokenPipeError,ConnectionResetError,socket.timeout):pass
     def do_GET(self):self.handle_method('GET')

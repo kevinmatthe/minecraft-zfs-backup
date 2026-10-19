@@ -20,7 +20,7 @@ class RollbackTests(unittest.TestCase):
         self.source=self.world/'.zfs'/'snapshot'/NAME;self.source.mkdir(parents=True)
         (self.source/'level.dat').write_bytes(b'old')
         self.state=self.root/'state';self.state.mkdir(mode=0o700)
-        self.config=SimpleNamespace(world_path=self.world,state_dir=self.state,crafty=object())
+        self.config=SimpleNamespace(world_path=self.world,state_dir=self.state,crafty=object(),source_dataset='tank/world')
         self.events=[]
         events=self.events;source=self.source
         class Backend:

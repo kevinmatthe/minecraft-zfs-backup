@@ -1,10 +1,12 @@
 """Durable one-click rollback coordinator. Failed jobs retain maintenance and holds."""
 from copy import deepcopy
 from pathlib import Path
+import logging
 import threading
 import time
 import uuid
 
+from .audit import AuditLog, AuditUnavailable, normalize_actor
 from .crafty import CraftyClient
 from .protocol import APIError, atomic_json, read_json
 from .restore import WorldLock, restore_world, validate_world
@@ -21,6 +23,7 @@ class RollbackManager:
         self.clock = clock or (lambda:int(time.time()*1000))
         self.restorer,self.validator,self.background = restorer,validator,background
         self.path = Path(config.state_dir)/'rollback.json'
+        self.audit = AuditLog(config.state_dir,config.world_path,config.source_dataset,self.clock)
         self._lock = threading.RLock()
         self._thread = None
         self._closing = threading.Event()
@@ -28,6 +31,7 @@ class RollbackManager:
         if self.path.exists():
             self._state = read_json(self.path,limit=1024*1024)
             self._validate_state()
+        for job in self._state['jobs'].values():self._flush_pending(job)
         current = self._state['current']
         if current:
             job = self._state['jobs'][current]
@@ -35,7 +39,9 @@ class RollbackManager:
                 self.service.enter_maintenance(current)
                 # A recorded failure requires explicit administrative resumption. Only an
                 # interrupted operation continues automatically on agent restart.
-                if job['phase'] != 'FAILED': self._launch(current)
+                if job['phase'] != 'FAILED':
+                    self._audit('RESTART_RESUME',job,actor=normalize_actor())
+                    self._launch(current)
 
     def _validate_state(self):
         if self._state.get('version') != 1 or not isinstance(self._state.get('jobs'),dict):
@@ -61,9 +67,18 @@ class RollbackManager:
     def _save(self):
         atomic_json(self.path,self._state,mode=0o600)
 
+    def _audit(self,event,job,actor=None,**fields):
+        return self.audit.append(event,actor=actor or job.get('actor') or normalize_actor(),
+                                 job_id=job['id'],snapshot=job['snapshot'],guid=job.get('guid'),**fields)
+
     def _update(self, identifier, phase=None, **fields):
         with self._lock:
             job=self._state['jobs'][identifier]
+            event=phase if phase in ('COMPLETED','FAILED','INTERRUPTED') else 'PHASE_INTENT'
+            self._audit(event,job,phase=phase or job['phase'],
+                        **({'error':fields['error']} if fields.get('error') else {}))
+            for key in ('pre_recovery','post_recovery'):
+                if fields.get(key):self._audit('RECOVERY_POINT',job,point=fields[key])
             if phase is not None: job['phase']=phase
             job.update(fields);job['updated_ms']=self.clock()
             self._save()
@@ -80,7 +95,54 @@ class RollbackManager:
             identifier=self._state['current']
             return deepcopy(self._state['jobs'][identifier]) if identifier else None
 
-    def submit(self, identifier, snapshot):
+    def submit(self, identifier, snapshot, actor=None):
+        return self._request('submit',identifier,snapshot,actor)
+
+    def flush_audit(self):
+        with self._lock:
+            for job in self._state['jobs'].values():self._flush_pending(job)
+
+    def _request(self,action,identifier,snapshot=None,actor=None):
+        self.flush_audit()
+        # Do not retain arbitrary invalid IDs, snapshot strings or raw request bodies.
+        context={}
+        try:
+            if isinstance(identifier,str) and str(uuid.UUID(identifier))==identifier:context['job_id']=identifier
+        except (ValueError,AttributeError):pass
+        if isinstance(snapshot,str) and OWNED.fullmatch(snapshot):
+            context['snapshot']=snapshot
+            # Include an observed identity even for busy/conflicting requests.
+            # Read failure never hides the original rejection or exposes backend text.
+            try:
+                guid=dict(self.backend.snapshots()).get(snapshot)
+                if isinstance(guid,str) and guid.isdigit():context['guid']=guid
+            except Exception:pass
+        elif action=='resume' and 'job_id' in context:
+            with self._lock:
+                job=self._state['jobs'].get(identifier)
+                if job:context.update(snapshot=job['snapshot'],guid=job['guid'])
+        normalized=normalize_actor()
+        try:
+            normalized=normalize_actor(actor)
+        except APIError as error:
+            self.audit.append('REQUEST',action=action,**context)
+            self.audit.append('REJECT',action=action,error=dict(code=error.code,message=error.message),**context)
+            raise
+        self.audit.append('REQUEST',actor=normalized,action=action,**context)
+        try:
+            if action=='submit':return self._submit(identifier,snapshot,normalized)
+            return self._resume(identifier,normalized)
+        except AuditUnavailable:raise
+        except APIError as error:
+            self.audit.append('REJECT',actor=normalized,action=action,
+                              error=dict(code=error.code,message=error.message),**context)
+            raise
+        except Exception:
+            self.audit.append('REJECT',actor=normalized,action=action,
+                              error=dict(code='internal_error',message='Operation failed; inspect administrator state'),**context)
+            raise
+
+    def _submit(self, identifier, snapshot, actor):
         try:
             if not isinstance(identifier,str) or str(uuid.UUID(identifier)) != identifier:
                 raise ValueError()
@@ -91,8 +153,9 @@ class RollbackManager:
         with self._lock:
             if identifier in self._state['jobs']:
                 previous=self._state['jobs'][identifier]
-                if previous['snapshot'] != snapshot:
-                    raise APIError(409,'identity_conflict','Rollback ID already selects another snapshot')
+                if previous['snapshot'] != snapshot or previous.get('actor',normalize_actor()) != actor:
+                    raise APIError(409,'identity_conflict','Rollback ID already selects another snapshot or actor')
+                self._audit('ACCEPT',previous,actor=actor,duplicate=True)
                 return deepcopy(previous)
             if self.busy: raise APIError(409,'maintenance','A rollback already requires maintenance')
             self.service.enter_maintenance(identifier)
@@ -104,10 +167,11 @@ class RollbackManager:
                 guid=available[snapshot]
                 if not isinstance(guid,str) or not guid.isdigit():
                     raise RuntimeError('invalid snapshot GUID')
-                job={'id':identifier,'snapshot':snapshot,'guid':guid,'phase':'INTENT',
+                job={'id':identifier,'snapshot':snapshot,'guid':guid,'actor':actor,'phase':'INTENT',
                      'created_ms':self.clock(),'updated_ms':self.clock(),'original_policy':None,
                      'pre_recovery':None,'post_recovery':None,'stop_baseline':None,'error':None,
                      'offline_confirmed':False,'policy_disabled_verified':False}
+                self._audit('ACCEPT',job)
                 self._state['jobs'][identifier]=job;self._state['current']=identifier
                 # Bound completed history; failed/active work remains available for recovery.
                 for old in list(self._state['jobs']):
@@ -127,14 +191,20 @@ class RollbackManager:
             self._thread.start()
         else: self._run(identifier)
 
-    def resume(self, identifier):
-        """Explicit administrative retry; never invoked automatically for FAILED jobs."""
+    def resume(self, identifier, actor=None):
+        """Explicit administrative retry; original requester remains immutable."""
+        return self._request('resume',identifier,actor=actor)
+
+    def _resume(self, identifier, actor):
         with self._lock:
             job=self.get(identifier)
             if self._state['current'] != identifier or job['phase'] != 'FAILED':
                 raise APIError(409,'not_resumable','Only the current failed rollback can resume')
             if self._thread and self._thread.is_alive():
                 raise APIError(409,'busy','Rollback worker is still finishing')
+            self._flush_pending(self._state['jobs'][identifier])
+            self._audit('ACCEPT',job,actor=actor,action='resume')
+            self._audit('EXPLICIT_RESUME',job,actor=actor)
             self.service.enter_maintenance(identifier)
             self._update(identifier,job.get('failed_phase','INTENT'),error=None)
             self._launch(identifier)
@@ -215,7 +285,68 @@ class RollbackManager:
         # releasing remaining holds, without stopping or rewriting the running world.
         self._complete(identifier)
 
-    def _run(self, identifier):
+    def _flush_pending(self,job):
+        while job.get('audit_pending'):
+            record=job['audit_pending'][0]
+            self._audit(record['event'],job,**record['fields'])
+            job['audit_pending'].pop(0);self._save()
+
+    def _audit_failure(self,identifier):
+        # Pause and enqueue evidence in ONE state write: a crash must never leave
+        # a runnable old phase alongside a durable audit-failure outbox.
+        with self._lock:
+            job=self._state['jobs'][identifier];phase=job['phase']
+            error={'code':'audit_unavailable','message':'Durable rollback audit is unavailable; operation paused'}
+            warned=False
+            def unavailable():
+                nonlocal warned
+                if not warned:
+                    logging.error('Rollback audit/state unavailable; evidence may be incomplete; holds retained')
+                    warned=True
+            def persist():
+                try:self._save()
+                except Exception:
+                    job['audit_state_unavailable']=True;unavailable()
+            def flush():
+                try:self._flush_pending(job)
+                except Exception:unavailable()
+            def enqueue(event,**fields):
+                job.setdefault('audit_pending',[]).append(dict(event=event,fields=dict(
+                    intent_id=str(uuid.uuid4()),occurred_ms=self.clock(),**fields)))
+            def evidence(event,**fields):
+                enqueue(event,**fields);persist();flush()
+            job.update(phase='FAILED',failed_phase=phase,error=error,updated_ms=self.clock())
+            enqueue('AUDIT_GAP',phase=phase,error=error)
+            enqueue('FAILED',phase='FAILED',error=error)
+            try:
+                persist();flush()
+            finally:
+                # The already-audited STARTING intent authorizes ONLY safety stop
+                # and disabling restart here, never restoration or another start.
+                # Neither audit nor state-filesystem failure may prevent the stop.
+                if job.get('post_recovery') is not None and phase!='FINALIZING':
+                    evidence('SAFETY_COMPENSATION_INTENT',phase=phase)
+                    job.update(offline_confirmed=False,policy_disabled_verified=False);persist()
+                    try:
+                        self.crafty.set_policy(_DISABLED)
+                        job['policy_disabled_verified']=True;persist()
+                    except Exception:pass
+                    try:baseline=self.crafty.stats()
+                    except Exception:baseline=None
+                    try:
+                        self.crafty.action('stop_server')
+                        if baseline and baseline.get('running') is True:self.crafty.wait_stopped(baseline)
+                        with WorldLock(self.config.world_path):
+                            job['offline_confirmed']=True;persist()
+                    except Exception:pass
+                    evidence('SAFETY_COMPENSATION',offline_confirmed=job['offline_confirmed'],
+                             policy_disabled_verified=job['policy_disabled_verified'])
+
+    def _run(self,identifier):
+        try:self._run_audited(identifier)
+        except AuditUnavailable:self._audit_failure(identifier)
+
+    def _run_audited(self, identifier):
         tag='minecraft-zfs-rollback-'+identifier
         may_be_running=False
         try:
@@ -258,6 +389,8 @@ class RollbackManager:
                 guard.check()
             may_be_running=True
             self._finish_start(identifier)
+        except AuditUnavailable:
+            self._audit_failure(identifier)
         except InterruptedError:
             interrupted=self.get(identifier)['phase']
             self._update(identifier,'INTERRUPTED',interrupted_phase=interrupted,error={'code':'agent_stopping',
@@ -276,6 +409,7 @@ class RollbackManager:
                     if baseline.get('running') is True: self.crafty.wait_stopped(baseline)
                     with WorldLock(self.config.world_path):
                         self._update(identifier,offline_confirmed=True)
+                except AuditUnavailable:return self._audit_failure(identifier)
                 except Exception: pass
             status=self.get(identifier)
             policy=('automatic restart is verified disabled' if status.get('policy_disabled_verified')

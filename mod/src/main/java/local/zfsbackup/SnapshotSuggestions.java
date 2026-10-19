@@ -51,7 +51,7 @@ final class SnapshotSuggestions {
   if(response==null||!(response.get("snapshots") instanceof List<?> snapshots))return List.of();
   SortedSet<String> names=new TreeSet<>();
   for(Object item:snapshots){
-   if(item instanceof Map<?,?> snapshot&&snapshot.get("name") instanceof String name&&name.matches("mc-hourly-[0-9]{8}T[0-9]{6}Z"))names.add(name);
+   if(item instanceof Map<?,?> snapshot&&snapshot.get("name") instanceof String name&&SnapshotNames.isPublished(name))names.add(name);
   }
   return List.copyOf(names);
  }

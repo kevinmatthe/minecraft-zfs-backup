@@ -30,7 +30,8 @@ public final class SnapshotSuggestionsTest {
  public static void main(String[] args)throws Exception{
   Path directory=Files.createTempDirectory("zfs-completion-test-");Path token=directory.resolve("token");Files.writeString(token,"test-only-completion-"+"a".repeat(40));
   String first="mc-hourly-20261019T060000Z",second="mc-hourly-20261019T070000Z",newest="mc-hourly-20261020T080000Z";
-  AtomicReference<String> reply=new AtomicReference<>(new String(JsonIO.encode(Map.of("snapshots",List.of(Map.of("name",first),Map.of("name",second),Map.of("name","pending-"+first),Map.of("name","unmanaged-point")))),StandardCharsets.UTF_8));
+  String live="mc-live-20261019T060000Z";
+  AtomicReference<String> reply=new AtomicReference<>(new String(JsonIO.encode(Map.of("snapshots",List.of(Map.of("name",first),Map.of("name",second),Map.of("name",live),Map.of("name","pending-"+live),Map.of("name","pending-"+first),Map.of("name","unmanaged-point")))),StandardCharsets.UTF_8));
   AtomicInteger hits=new AtomicInteger(),status=new AtomicInteger(200),delay=new AtomicInteger();AtomicBoolean mutated=new AtomicBoolean();AtomicLong elapsed=new AtomicLong(1000);
   HttpServer server=HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(),0),0);
   ExecutorService workers=Executors.newFixedThreadPool(2,task->{Thread thread=new Thread(task,"completion-http-test");thread.setDaemon(true);return thread;});server.setExecutor(workers);
@@ -43,9 +44,10 @@ public final class SnapshotSuggestionsTest {
   try(AgentClient client=new AgentClient(URI.create("http://127.0.0.1:"+server.getAddress().getPort()),token,Duration.ofMillis(600))){
    SnapshotSuggestions source=new SnapshotSuggestions(()->client.get("/v1/snapshots"),elapsed::get);CommandDispatcher<Boolean> dispatcher=dispatcher(source);
    List<String> all=names(complete(dispatcher,"zfsbackup rollback ",true).get(3,TimeUnit.SECONDS));
-   check(all.containsAll(List.of("status",first,second))&&!all.contains("pending-"+first)&&!all.contains("unmanaged-point"),"trailing-space completion must include current published snapshots and status only");passed++;
+   check(all.containsAll(List.of("status",first,second,live))&&!all.contains("pending-"+first)&&!all.contains("pending-"+live)&&!all.contains("unmanaged-point"),"trailing-space completion must include current published snapshots and status only");passed++;
    List<String> prefix=names(complete(dispatcher,"zfsbackup rollback mc-hourly-20261019T07",true).get(3,TimeUnit.SECONDS));
-   check(prefix.equals(List.of(second)),"prefix completion");check(hits.get()==1,"brief cache avoids per-keypress requests");passed++;
+   check(prefix.equals(List.of(second)),"hourly prefix completion");
+   check(names(complete(dispatcher,"zfsbackup rollback mc-live-20261019",true).get(3,TimeUnit.SECONDS)).equals(List.of(live)),"live prefix completion");passed++;check(hits.get()==1,"brief cache avoids per-keypress requests");passed++;
    check(names(complete(dispatcher,"zfsbackup rollback ",false).get(3,TimeUnit.SECONDS)).isEmpty(),"non-operator receives no snapshot suggestions");passed++;
    reply.set(new String(JsonIO.encode(Map.of("snapshots",List.of(Map.of("name",newest)))),StandardCharsets.UTF_8));elapsed.addAndGet(501);
    List<String> refreshed=names(complete(dispatcher,"zfsbackup rollback mc-hourly-",true).get(3,TimeUnit.SECONDS));check(refreshed.equals(List.of(newest)),"on-demand refresh replaces removed snapshot names");passed++;

@@ -6,7 +6,7 @@ public final class CheckpointTest {
  static void check(boolean value,String message){if(!value)throw new AssertionError(message);}
  static final class Rig implements Checkpoint.Port {
   long time=100000,elapsed=1000,busyDelay;boolean frozen,busy,failSave,queueCallbacks;
-  Queue<Runnable> callbacks=new ArrayDeque<>();int freezes,restores;String snapshot="mc-hourly-20261019T060000Z";
+  Queue<Runnable> callbacks=new ArrayDeque<>();int freezes,restores;String snapshot="mc-live-20261019T060000Z";
   Checkpoint.Request request;List<String> events=new ArrayList<>();
   CompletableFuture<Checkpoint.Reply> prepared=new CompletableFuture<>(),ready=new CompletableFuture<>(),committed=new CompletableFuture<>();
   CompletableFuture<Void> barrier=CompletableFuture.completedFuture(null);

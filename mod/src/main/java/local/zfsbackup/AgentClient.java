@@ -66,7 +66,7 @@ final class AgentClient implements AutoCloseable {
  }
  CompletionStage<Map<String,Object>> get(String path){return call("GET",path,null,requestTimeout,0);}
  CompletionStage<Map<String,Object>> rollback(UUID id,String snapshot){
-  if(!snapshot.matches("mc-hourly-[0-9]{8}T[0-9]{6}Z"))return CompletableFuture.failedFuture(new IOException("select a managed published snapshot name"));
+  if(!SnapshotNames.isPublished(snapshot))return CompletableFuture.failedFuture(new IOException("select a managed published snapshot name"));
   return call("POST","/v1/rollbacks",Map.of("id",id.toString(),"snapshot",snapshot),requestTimeout,202).thenApply(job->{
    try{if(!JsonIO.uuid(job,"id").equals(id)||!JsonIO.string(job,"snapshot").equals(snapshot))throw new IOException("mismatching rollback job");return job;}
    catch(IOException error){throw new CompletionException(error);}

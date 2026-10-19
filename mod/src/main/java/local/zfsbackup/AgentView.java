@@ -11,9 +11,16 @@ final class AgentView {
  }
  static String snapshots(Map<String,Object> value){
   if(!(value.get("snapshots") instanceof List<?> snapshots))return "Invalid snapshot listing from agent.";
-  if(snapshots.isEmpty())return "No managed published snapshots.";
+  List<Map<String,Object>> published=new ArrayList<>();
+  for(Object item:snapshots){Map<String,Object> point=object(item);if(point.get("name") instanceof String name&&SnapshotNames.isPublished(name))published.add(point);}
+  if(published.isEmpty())return "No managed published snapshots.";
   StringJoiner lines=new StringJoiner("\n");int shown=0;
-  for(Object item:snapshots){if(shown++>=24)break;Map<String,Object> point=object(item);lines.add(field(point,"name","invalid")+" ["+field(point,"event","unknown")+"] GUID="+field(point,"guid","unknown"));}
+  for(Map<String,Object> point:published){
+   if(shown++>=64)break;
+   String name=(String)point.get("name"),family=name.startsWith("mc-live-")?"live":"hourly";
+   lines.add(name+" ["+family+"; "+field(point,"event","unknown")+"] GUID="+field(point,"guid","unknown"));
+  }
+  if(published.size()>64)lines.add("Showing first 64 of "+published.size()+" local snapshots; Tab completion includes the full agent listing.");
   return lines.toString();
  }
  static String rollback(Map<String,Object> value){

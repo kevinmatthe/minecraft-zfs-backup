@@ -131,7 +131,7 @@ public final class ZfsBackupMod {
      CommandSourceStack source=context.getSource();
      if(client==null){message(source,"HTTP ZFS bridge unavailable");return 0;}
      String snapshot=StringArgumentType.getString(context,"snapshot");
-     if(!snapshot.matches("mc-hourly-[0-9]{8}T[0-9]{6}Z")){message(source,"Choose an exact managed snapshot name from /zfsbackup list.");return 0;}
+     if(!SnapshotNames.isPublished(snapshot)){message(source,"Choose an exact managed snapshot name from /zfsbackup list.");return 0;}
      UUID id=UUID.randomUUID();
      message(source,"Rollback requested; the agent will stop this server before restoring the selected world.");
      complete(source,client.rollback(id,snapshot),AgentView::rollback);return 1;

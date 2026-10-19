@@ -71,6 +71,10 @@ public final class AgentClientTest {
    response.set(new String(JsonIO.encode(Map.of("id",jobId.toString(),"snapshot",snapshot,"phase","INTENT")),StandardCharsets.UTF_8));
    Map<String,Object> job=client.rollback(jobId,snapshot).toCompletableFuture().get(3,TimeUnit.SECONDS);
    check(path.get().equals("/v1/rollbacks")&&job.get("id").equals(jobId.toString()),"accepted rollback job");passed++;
+   String live="mc-live-20261019T060000Z";UUID liveJob=UUID.randomUUID();
+   response.set(new String(JsonIO.encode(Map.of("id",liveJob.toString(),"snapshot",live,"phase","INTENT")),StandardCharsets.UTF_8));
+   check(client.rollback(liveJob,live).toCompletableFuture().get(3,TimeUnit.SECONDS).get("snapshot").equals(live),"live-family rollback accepted over real HTTP");passed++;
+   for(String invalid:List.of("pending-"+live,"foreign-20261019T060000Z",live+"-extra","mc-live-20261019T060000z"))fails(client.rollback(UUID.randomUUID(),invalid),token);
    status.set(200);client.get("/v1/rollbacks/current").toCompletableFuture().get(3,TimeUnit.SECONDS);check(path.get().equals("/v1/rollbacks/current"),"job status on future startup");passed++;
    int quietHits=hits.get();Thread.sleep(250);check(hits.get()==quietHits,"client sends no periodic heartbeat or file polling requests");passed++;
    System.out.println(passed+" real HTTP client checks passed");

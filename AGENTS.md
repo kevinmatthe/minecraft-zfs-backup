@@ -1,0 +1,12 @@
+# Minecraft ZFS Backup
+
+This independent repository contains a server-side NeoForge 1.21.1 mod and a Python 3.11+ host agent.
+Read `docs/protocol.md` before modifying either side of their shared-directory protocol.
+
+- Production worlds and infrastructure are outside this repository. Tests must use temporary directories, disposable ZFS datasets, or a separate validation Minecraft server. Never change production from a unit test or build script.
+- Keep Java game lifecycle logic on the server thread. Never block the game thread waiting for host responses or replication. Restore every dimension's prior saving flag on success, error, timeout and shutdown.
+- The mod must not execute host commands, access a Docker socket, or accept arbitrary datasets/paths from chat commands. Host paths/datasets come from administrator-owned configuration only.
+- Only publish snapshots after the matching mod commit. Expired/cancelled requests cannot publish snapshots. Replication must not use forced rollback/overwrite. Prune only owned snapshots after matching destination GUID verification.
+- Write meaningful failing tests before implementing lifecycle/protocol changes. Test timeout, cancellation, stale messages, process restart, and replication failures.
+- Build target: Java 21, Minecraft 1.21.1, NeoForge 21.1.251. Do not upgrade the live server's dependencies while building this project.
+- Stage only files owned by your task; multiple agents may work in disjoint subdirectories. Do not commit another agent's pending changes.

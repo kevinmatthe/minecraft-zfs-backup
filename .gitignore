@@ -1,0 +1,12 @@
+.gradle/
+build/
+**/build/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+*.local.json
+run/
+.idea/
+*.iml

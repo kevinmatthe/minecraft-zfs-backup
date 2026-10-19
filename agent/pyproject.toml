@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minecraft-zfs-agent"
+version = "1.0.0"
+description = "Persistent host agent for mod-coordinated Minecraft ZFS checkpoints"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+minecraft-zfs-agent = "minecraft_zfs_agent.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["minecraft_zfs_agent*"]

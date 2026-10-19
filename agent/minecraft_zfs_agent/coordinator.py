@@ -23,7 +23,7 @@ class CheckpointService:
         if config.state_dir.is_symlink() or info.st_uid!=os.geteuid() or info.st_mode&0o077:raise ValueError('state must be agent-owned mode0700')
         self.path=config.state_dir/'ledger.json'
         try:self.ledger=read_json(self.path,limit=2*1024*1024)
-        except FileNotFoundError:self.ledger=dict(version=2,active=None,operations={},lifecycle={},recovery={},last_accepted_ms=None,last_success=None,last_error=None)
+        except FileNotFoundError:self.ledger=dict(version=2,active=None,operations={},lifecycle={},recovery={},last_accepted_ms=None,last_hourly_accepted_ms=None,last_success=None,last_error=None)
         if self.ledger.get('version')!=2:raise ValueError('use a new HTTP state directory')
         self._reconcile()
         self.retention_tick()
@@ -58,7 +58,7 @@ class CheckpointService:
         try:self.expire()
         except Exception:logging.exception('checkpoint deadline cleanup failed')
     def _members(self,op):
-        # Old version2 single-snapshot journals remain valid.
+        # Preserve version2 single-snapshot journals and old two-member bundles.
         return op.get('snapshots') or ([op] if op.get('snapshot') else [])
     def _cleanup(self,op,state):
         members=self._members(op);names=dict(self.backend.snapshots())
@@ -98,7 +98,7 @@ class CheckpointService:
             self._schedule()
     def _window(self,body):
         object_fields(body,{'id','event','created_ms','deadline_ms'});identifier(body['id'])
-        if body['event'] not in ('manual_save','periodic_save'):raise APIError(400,'invalid_event','Unsupported checkpoint event')
+        if body['event'] not in ('manual_save','periodic_save','hourly_save'):raise APIError(400,'invalid_event','Unsupported checkpoint event')
         created,deadline=timestamp(body['created_ms']),timestamp(body['deadline_ms'])
         if created>self.clock()+1000 or not 0<deadline-created<=60000:raise APIError(400,'invalid_window','Invalid freeze window')
     def _get(self,id):
@@ -122,10 +122,12 @@ class CheckpointService:
             if self.clock()>=body['deadline_ms']:raise APIError(410,'expired','Freeze budget expired')
             self._preflight()
             if self.clock()>=body['deadline_ms']:raise APIError(410,'expired','Source preparation exceeded freeze budget')
-            previous=self.ledger['last_accepted_ms']
+            # Scheduled full saves have a separate budget from live/manual traffic.
+            acceptance_key='last_hourly_accepted_ms' if body['event']=='hourly_save' else 'last_accepted_ms'
+            previous=self.ledger.get(acceptance_key)
             if previous is not None and self.clock()-previous<self.config.min_interval_seconds*1000:raise APIError(409,'rate_limited','Minimum checkpoint interval has not elapsed')
             op=body|dict(state='PREPARED',updated_ms=self.clock())
-            self.ledger['operations'][body['id']]=op;self.ledger['active']=body['id'];self.ledger['last_accepted_ms']=self.clock()
+            self.ledger['operations'][body['id']]=op;self.ledger['active']=body['id'];self.ledger[acceptance_key]=self.clock()
             self._bounded(self.ledger['operations']);self.save();self._schedule();return self._public(op)
     def _name(self,created,family='hourly'):
         names=dict(self.backend.snapshots());stamp=created//1000
@@ -143,9 +145,8 @@ class CheckpointService:
             if self.clock()>=op['deadline_ms']:self._cleanup(op,'EXPIRED');raise APIError(410,'expired','Freeze budget expired')
             self._preflight()
             families=['live'] if op['event']=='periodic_save' else ['hourly']
-            # The UTC family bucket is the frozen capture/barrier start, not a later rename.
+            # Retain capture-hour metadata for journal compatibility and diagnostics.
             captured=self.clock();hour=captured//3600000
-            if op['event']=='periodic_save' and hour>self.ledger.get('periodic_hour',-1):families.append('hourly')
             members=[dict(snapshot=self._name(captured,family),family=family) for family in families]
             op.update(state='SNAPSHOTTING',snapshot=members[0]['snapshot'],snapshot_hour=hour,snapshots=members,frozen_ms=frozen,updated_ms=self.clock());self.save()
             for member in members:

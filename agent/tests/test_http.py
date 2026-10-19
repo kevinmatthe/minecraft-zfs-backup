@@ -49,6 +49,18 @@ class HTTPTests(HTTPFixture):
         status,value=self.request('/v1/checkpoints/'+id+'/commit','POST',json.dumps(dict(committed_ms=now)))
         self.assertEqual((status,value['state']),(200,'COMMITTED'))
         status,value=self.request('/v1/snapshots');self.assertEqual(value['snapshots'][0]['event'],'manual_save')
+    def test_independent_hourly_checkpoint_roundtrip_creates_only_hourly(self):
+        import time,uuid
+        now=time.time_ns()//1_000_000;id=str(uuid.uuid4())
+        status,prepared=self.request('/v1/checkpoints','POST',json.dumps(dict(id=id,event='hourly_save',created_ms=now,deadline_ms=now+15000)))
+        self.assertEqual((status,prepared['state']),(200,'PREPARED'))
+        status,ready=self.request('/v1/checkpoints/'+id+'/snapshot','POST',json.dumps(dict(frozen_ms=now)))
+        self.assertEqual(status,200)
+        self.assertEqual([member['family'] for member in ready['snapshots']],['hourly'])
+        status,committed=self.request('/v1/checkpoints/'+id+'/commit','POST',json.dumps(dict(committed_ms=now)))
+        self.assertEqual((status,committed['state']),(200,'COMMITTED'))
+        status,listed=self.request('/v1/snapshots')
+        self.assertEqual([(row['event'],row['family']) for row in listed['snapshots']],[('hourly_save','hourly')])
     def test_workers_are_bounded_and_excess_socket_gets503(self):
         a=http.client.HTTPConnection(*self.server.server_address);a.connect();a.sock.sendall(b'GET /healthz HTTP/1.1\r\n')
         b=http.client.HTTPConnection(*self.server.server_address);b.connect();b.sock.sendall(b'GET /healthz HTTP/1.1\r\n')

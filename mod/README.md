@@ -11,7 +11,7 @@ cd mod
 ./gradlew build
 ```
 
-The standard build pins ModDevGradle 2.2.048, NeoForge 21.1.251 and Gradle 8.14.3. The wrapper distribution has a pinned SHA-256. Gradle produces `build/libs/local-zfs-backup-1.21.1-2.2.0.jar`.
+The standard build pins ModDevGradle 2.0.148, NeoForge 21.1.251 and Gradle 8.14.3. The wrapper distribution has a pinned SHA-256. Gradle produces `build/libs/local-zfs-backup-1.21.1-2.2.0.jar`.
 
 The portable builder compiles and tests against existing matching server libraries, without downloading Minecraft dependencies:
 

@@ -3,6 +3,18 @@
   "minVersion": "0.8.5",
   "package": "local.zfsbackup.mixin",
   "compatibilityLevel": "JAVA_21",
-  "mixins": ["ShutdownEvidenceMixin"],
-  "injectors": {"defaultRequire": 0}
+  "mixins": [
+    "ShutdownEvidenceMixin",
+    "AutosaveServerMixin",
+    "ChunkStorageAccessor",
+    "SimpleRegionStorageAccessor",
+    "ServerLevelAccessor",
+    "EntityStorageAccessor",
+    "SectionStorageMixin",
+    "EntitySectionManagerMixin",
+    "IOWorkerMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 0
+  }
 }

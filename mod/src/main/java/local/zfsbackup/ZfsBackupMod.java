@@ -32,6 +32,7 @@ public final class ZfsBackupMod {
  private static final Logger LOG=LoggerFactory.getLogger("ZfsBackup");
  private Checkpoint checkpoint;
  private AgentClient client;
+ private ServerPort serverPort;
  private SnapshotSuggestions snapshotSuggestions;
  private boolean snapshotOnShutdown=true;
 
@@ -50,18 +51,25 @@ public final class ZfsBackupMod {
    Path root=server.getServerDirectory().toAbsolutePath().normalize();
    Properties properties=new Properties();Path config=root.resolve("config/local-zfs-backup.properties");
    if(Files.exists(config))try(Reader reader=Files.newBufferedReader(config)){properties.load(reader);}
-   long interval=Long.parseLong(properties.getProperty("interval_seconds","3600"));
+   // Retained only as an unused compatibility constructor argument; vanilla owns scheduling.
+   long interval=3600;
    long timeout=Long.parseLong(properties.getProperty("freeze_timeout_seconds","15"));
-   if(interval<60||interval>31536000||timeout<1||timeout>15)throw new IllegalArgumentException("invalid interval or freeze timeout");
-   boolean onlyIfActive=bool(properties,"only_if_players_been_online",true);
+   if(timeout<1||timeout>15)throw new IllegalArgumentException("invalid freeze timeout");
+   boolean onlyIfActive=bool(properties,"only_if_players_been_online",false);
    snapshotOnShutdown=bool(properties,"snapshot_on_shutdown",true);
    URI url=URI.create(properties.getProperty("agent_url","http://minecraft-zfs-agent:8765"));
    Path token=root.resolve(properties.getProperty("agent_token_file","config/local-zfs-backup.token")).normalize();
    client=new AgentClient(url,token);
    AgentClient activeClient=client;
    snapshotSuggestions=new SnapshotSuggestions(()->activeClient.get("/v1/snapshots"),()->System.nanoTime()/1_000_000);
-   checkpoint=new Checkpoint(new ServerPort(server,client),System::currentTimeMillis,()->System.nanoTime()/1_000_000,interval*1000,timeout*1000,onlyIfActive);
-   LOG.info("HTTP ZFS bridge enabled: interval {}s, checkpoint budget {}s, shutdown snapshot {}",interval,timeout,snapshotOnShutdown);
+   serverPort=new ServerPort(server,client);
+   checkpoint=new Checkpoint(serverPort,System::currentTimeMillis,()->System.nanoTime()/1_000_000,interval*1000,timeout*1000,onlyIfActive,true);
+   AutosaveObserver observer=new AutosaveObserver(AutosaveHooks.errors(),baseline->{
+    serverPort.errorBaseline=baseline;
+    if(checkpoint!=null)checkpoint.autosave();
+   },()->{if(checkpoint!=null)checkpoint.externalSave();});
+   serverPort.observer=observer;AutosaveHooks.attach(server,observer);
+   LOG.info("HTTP ZFS bridge enabled: vanilla autosave completion, checkpoint budget {}s, shutdown snapshot {}; interval_seconds does not schedule saves",timeout,snapshotOnShutdown);
    client.lifecycle(AgentClient.LifecycleEvent.SERVER_STARTED,false,UUID.randomUUID(),System.currentTimeMillis()).whenComplete((reply,error)->{
     if(error==null)LOG.info("Server-started lifecycle event recorded");else LOG.warn("Server-started lifecycle event failed: {}",diagnostic(error));
    });
@@ -69,9 +77,9 @@ public final class ZfsBackupMod {
     if(error==null)LOG.info("Latest {}",AgentView.rollback(job));
    });
   }catch(Exception error){
-   if(client!=null){client.close();client=null;}checkpoint=null;snapshotSuggestions=null;
+   if(client!=null){client.close();client=null;}checkpoint=null;serverPort=null;snapshotSuggestions=null;AutosaveHooks.detach(server);
    // Exceptions from URI/auth machinery may contain administrator values; never print them.
-   LOG.error("HTTP ZFS bridge disabled: check agent URL, regular token file and configuration values");
+   LOG.error("HTTP ZFS bridge disabled: check agent URL, regular token file, configuration and native autosave/storage hooks");
   }
  }
  private static boolean bool(Properties properties,String key,boolean fallback){
@@ -88,6 +96,7 @@ public final class ZfsBackupMod {
    if(event.getServer().getPlayerCount()>0)checkpoint.playerActivity();
    checkpoint.shutdown();
   }
+  AutosaveHooks.detach(event.getServer());
  }
  private void stopped(ServerStoppedEvent event){
   if(client==null)return;
@@ -102,7 +111,7 @@ public final class ZfsBackupMod {
    LOG.info("Server-stopped lifecycle event accepted: {}",reply.get("state"));
   }catch(InterruptedException interrupted){Thread.currentThread().interrupt();LOG.warn("Server-stopped lifecycle wait interrupted");}
   catch(Exception error){LOG.warn("Server-stopped lifecycle request failed within bounded shutdown wait: {}",diagnostic(error));}
-  finally{client.close();client=null;checkpoint=null;snapshotSuggestions=null;}
+  finally{client.close();client=null;checkpoint=null;serverPort=null;snapshotSuggestions=null;AutosaveHooks.detach(event.getServer());}
  }
  private void commands(RegisterCommandsEvent event){
   event.getDispatcher().register(Commands.literal("zfsbackup").requires(source->source.hasPermission(4))
@@ -154,8 +163,12 @@ public final class ZfsBackupMod {
  }
  private static final class ServerPort implements Checkpoint.Port {
   private final MinecraftServer server;private final AgentClient client;
+  private final WriteGate writeGate=new WriteGate();
+  private final NativeSaveBarrier nativeSave;
+  private AutosaveObserver observer;
+  private long errorBaseline;
   private final SavingGuard<ServerLevel> guard=new SavingGuard<>(level->level.noSave,(level,value)->level.noSave=value);
-  ServerPort(MinecraftServer server,AgentClient client){this.server=server;this.client=client;}
+  ServerPort(MinecraftServer server,AgentClient client){this.server=server;this.client=client;this.nativeSave=new NativeSaveBarrier(server,writeGate);}
   public CompletionStage<Checkpoint.Reply> prepare(Checkpoint.Request request){return client.prepare(request);}
   public CompletionStage<Checkpoint.Reply> snapshot(Checkpoint.Request request,long frozen){return client.snapshot(request,frozen);}
   public CompletionStage<Checkpoint.Reply> commit(Checkpoint.Request request,long committed){return client.commit(request,committed);}
@@ -164,16 +177,22 @@ public final class ZfsBackupMod {
    try{return (boolean)Class.forName("net.creeperhost.ftbbackups.BackupHandler").getMethod("isRunning").invoke(null);}
    catch(ClassNotFoundException absent){return false;}
   }
-  public void freeze(){guard.freeze(server.getAllLevels());}
-  public void flush(){if(!server.saveEverything(false,true,true))throw new IllegalStateException("forced save failed");}
+  public void freeze(){nativeSave.bind();writeGate.freeze();guard.freeze(server.getAllLevels());}
+  public void flush()throws Exception{
+   errorBaseline=AutosaveHooks.errors().generation();
+   observer.ownCapture(()->{if(!server.saveEverything(false,true,true))throw new IllegalStateException("forced save failed");});
+  }
   public CompletionStage<Void> barrier()throws Exception{
+   CompletionStage<Void> companion;
    try{
     Object result=Class.forName("local.asyncplayersave.AsyncPlayerSave").getMethod("backupCheckpoint",MinecraftServer.class).invoke(null,server);
     if(!(result instanceof CompletionStage<?> stage))throw new IllegalStateException("incompatible asynchronous save integration");
-    return stage.thenApply(ignored->null);
-   }catch(ClassNotFoundException absent){return CompletableFuture.completedFuture(null);}
+    companion=stage.thenApply(ignored->null);
+   }catch(ClassNotFoundException absent){companion=CompletableFuture.completedFuture(null);}
+   long baseline=errorBaseline;
+   return SaveBarriers.after(companion,server::execute,()->nativeSave.synchronize(baseline));
   }
-  public void restore(){guard.restore();}
+  public void restore(){try{guard.restore();}finally{writeGate.restore();}}
   public void execute(Runnable action){server.execute(action);}
  }
 }

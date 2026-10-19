@@ -18,3 +18,5 @@ type="required"
 versionRange="[1.21.1]"
 ordering="NONE"
 side="SERVER"
+[[mixins]]
+config="local_zfs_backup.mixins.json"

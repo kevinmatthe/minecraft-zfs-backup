@@ -91,7 +91,9 @@ public final class ZfsBackupMod {
    // Verified in patched NeoForge21.1.251 MinecraftServer.runServer: stopServer() closes
    // ServerLevels and LevelStorageAccess before handleServerStopped posts this event.
    // This is the ONLY HTTP wait: gameplay/world saving has already stopped.
-   boolean backup=checkpoint!=null&&checkpoint.wantsShutdownSnapshot(snapshotOnShutdown);
+   boolean clean=event.getServer() instanceof ShutdownEvidenceAccess evidence&&evidence.zfs$hasCleanShutdown();
+   boolean backup=clean&&checkpoint!=null&&checkpoint.wantsShutdownSnapshot(snapshotOnShutdown);
+   if(!clean)LOG.warn("Shutdown save/close could not be verified; recording server-stopped event without requesting a snapshot");
    Map<String,Object> reply=client.lifecycle(AgentClient.LifecycleEvent.SERVER_STOPPED,backup,UUID.randomUUID(),System.currentTimeMillis()).toCompletableFuture().get(20,TimeUnit.SECONDS);
    LOG.info("Server-stopped lifecycle event accepted: {}",reply.get("state"));
   }catch(InterruptedException interrupted){Thread.currentThread().interrupt();LOG.warn("Server-stopped lifecycle wait interrupted");}

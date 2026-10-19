@@ -1,0 +1,8 @@
+{
+  "required": false,
+  "minVersion": "0.8.5",
+  "package": "local.zfsbackup.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": ["ShutdownEvidenceMixin"],
+  "injectors": {"defaultRequire": 0}
+}

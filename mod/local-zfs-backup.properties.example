@@ -9,6 +9,7 @@ interval_seconds=3600
 freeze_timeout_seconds=15
 # Manual /zfsbackup save bypasses the idle gate; activity survives the last player's departure.
 only_if_players_been_online=true
-# Send server_stopped after world close, requesting a snapshot according to the activity policy.
+# Always send server_stopped; request a snapshot only after verified successful save/close
+# and according to the activity policy. Missing/failing shutdown instrumentation skips backup.
 # The host records the event but skips its snapshot during rollback maintenance.
 snapshot_on_shutdown=true

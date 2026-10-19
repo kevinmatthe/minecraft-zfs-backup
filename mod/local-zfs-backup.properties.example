@@ -1,0 +1,7 @@
+# Copy to the dedicated server's config/local-zfs-backup.properties before startup.
+interval_seconds=3600
+# Includes forced flush, optional asynchronous save barriers and host acknowledgement.
+# Maximum allowed value is 15. Forced disk I/O itself cannot be interrupted safely.
+freeze_timeout_seconds=15
+# Relative to server root; operator commands cannot change this path.
+bridge_directory=.zfs-snapshot-bridge

@@ -1,0 +1,28 @@
+plugins {
+    id 'java-library'
+    id 'net.neoforged.moddev' version '2.0.148'
+}
+
+group = 'local.zfsbackup'
+version = '1.0.0'
+java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+
+neoForge {
+    version = '21.1.251'
+    mods {
+        local_zfs_backup { sourceSet sourceSets.main }
+    }
+}
+
+// Dependency-free executable tests also run in the portable supplied-libraries build.
+['CheckpointTest', 'MailboxTest', 'SavingGuardTest'].each { testClass ->
+    def testTask = tasks.register(testClass, JavaExec) {
+        dependsOn testClasses
+        classpath = sourceSets.test.runtimeClasspath
+        mainClass = "local.zfsbackup.${testClass}"
+        javaLauncher = javaToolchains.launcherFor {
+            languageVersion = JavaLanguageVersion.of(21)
+        }
+    }
+    tasks.named('check') { dependsOn testTask }
+}

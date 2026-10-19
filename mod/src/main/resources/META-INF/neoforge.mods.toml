@@ -1,0 +1,20 @@
+modLoader="javafml"
+loaderVersion="[4,)"
+license="MIT"
+[[mods]]
+modId="local_zfs_backup"
+version="1.0.0"
+displayName="Minecraft ZFS Backup Bridge"
+description='''Server-side bounded save checkpoints for an administrator-managed host ZFS agent.'''
+[[dependencies.local_zfs_backup]]
+modId="neoforge"
+type="required"
+versionRange="[21.1.251,21.2)"
+ordering="NONE"
+side="SERVER"
+[[dependencies.local_zfs_backup]]
+modId="minecraft"
+type="required"
+versionRange="[1.21.1]"
+ordering="NONE"
+side="SERVER"

@@ -1,6 +1,5 @@
 {
   "source_dataset": "tank/minecraft-world",
-  "target_dataset": "backup/minecraft-world",
   "world_path": "/srv/minecraft/world",
   "mailbox_path": "/srv/minecraft/.zfs-snapshot-bridge",
   "state_dir": "/var/lib/minecraft-zfs-agent",

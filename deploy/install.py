@@ -28,7 +28,7 @@ def render_unit(repo, config):
                        ('/usr/bin/python3','-m','minecraft_zfs_agent','--config',config,'run'))
     return '\n'.join([
         '[Unit]',
-        'Description=Minecraft ZFS snapshot and replication host agent',
+        'Description=Minecraft local ZFS snapshot host agent',
         'After=local-fs.target zfs-mount.service',
         '',
         '[Service]',

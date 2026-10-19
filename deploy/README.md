@@ -25,7 +25,7 @@ Once healthy, use `/zfsbackup save`, `/zfsbackup status` and `/zfsbackup list`. 
 
 ## Optional Crafty rollback
 
-Configure the optional `crafty` object with the Crafty API URL, one fixed server ID and a separate Crafty token file. Use HTTPS with certificate verification; configure a trusted CA file for a private CA. The hostname must match the certificate. Crafty4.11.0 default certificates include `*.local`, so a private Docker network alias such as `minecraft-crafty.local` can supply a matching name without disabling verification. The private example network does not expose the companion API externally.
+Configure the optional `crafty` object with the Crafty API URL, one fixed server ID and a separate Crafty token file. Use HTTPS with certificate verification; configure a trusted CA file for a private CA. The hostname must match the certificate. For an existing self-signed certificate, add a private Docker network alias matching an explicit DNS name in its SAN and trust that certificate. Confirm the actual certificate names rather than relying on wildcard matching. The private example network does not expose the companion API externally.
 
 Use a dedicated non-superuser Crafty account with a role assigned only to this server. Both its role and API key need COMMANDS and CONFIG permissions (`10000010` in Crafty4.11.0); the key needs no Crafty management permissions or full access. This permits stop/start and temporary restart-policy changes without sharing an administrator credential. The Mod bearer token and Crafty token are separate secrets.
 

@@ -14,7 +14,7 @@ Validated on2026-10-19 using Java21, Minecraft1.21.1, NeoForge21.1.251 and OpenZ
 
 - A fresh `/zfsbackup rollback` command completes stop→pre-recovery→restore→validate→start without interruption. The selected marker and extra-file presence match the chosen snapshot; the distinct pre-recovery snapshot retains the prior marker. Source and recovery holds are released only after successful readiness and policy restoration. Explicit resumption of the earlier safe failure also succeeds without replacing its original pre-recovery point.
 - A subsequent normal stop publishes a `server_stopped` checkpoint. Disposable containers and their private network are removed after validation; small dataset/state evidence remains isolated.
-- Independent Python3.11 suite:80tests,78passed and2prerequisite-gated tests skipped. The optional Java-lock and real-ZFS tests were also exercised separately. Reviews found and closed shutdown, HTTP deadline, TLS compatibility and publication-recovery issues.
+- Python3.11 suite:81tests,79passed and2prerequisite-gated tests skipped. The optional Java-lock and real-ZFS tests were also exercised separately. Reviews found and closed shutdown, HTTP deadline, TLS compatibility and publication-recovery issues.
 - Production runs Mod2.0 with a healthy private-network HTTP companion and the scoped Crafty integration. Its real manual checkpoint `mc-hourly-20261019T075316Z` has GUID `14209830665387297159` on both source and Storage. Native TrueNAS replication job21747 succeeded. Production rollback was not used as a test.
 
 ## Earlier snapshot and replication validation

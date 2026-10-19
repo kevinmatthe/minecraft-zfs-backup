@@ -24,7 +24,7 @@ public final class CheckpointTest {
  }
  static void test(String name,Runnable r){r.run();passed++;System.out.println("PASS "+name);}
  public static void main(String[] args){
-  test("elapsed wall timer",()->{Rig r=new Rig();r.c.tick();check(r.freezes==0,"no startup checkpoint");r.time+=3600000;r.heartbeat=r.time;r.c.tick();check(r.freezes==1,"wall-time due");});
+  test("elapsed wall timer",()->{Rig r=new Rig();r.c.playerActivity();r.c.tick();check(r.freezes==0,"no startup checkpoint");r.time+=3600000;r.heartbeat=r.time;r.c.tick();check(r.freezes==1,"wall-time due");});
   test("stale and future heartbeat",()->{for(long offset:new long[]{-5001,1001}){Rig r=new Rig();r.heartbeat+=offset;r.c.now();check(r.freezes==0,"heartbeat must fail closed");}});
   test("heartbeat freshness checked immediately before freeze",()->{Rig r=new Rig();r.busyDelay=5001;r.c.now();check(!r.frozen,"reflection delay must not use stale heartbeat");});
   test("FTB defers",()->{Rig r=new Rig();r.busy=true;r.c.now();check(!r.frozen,"FTB active");});

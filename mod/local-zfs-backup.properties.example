@@ -1,5 +1,8 @@
 # Copy to the dedicated server's config/local-zfs-backup.properties before startup.
 interval_seconds=3600
+# Automatic checkpoints need player activity since the last successful checkpoint.
+# Activity after the last player leaves remains pending; manual commands bypass this gate.
+only_if_players_been_online=true
 # Includes forced flush, optional asynchronous save barriers and host acknowledgement.
 # Maximum allowed value is 15. Forced disk I/O itself cannot be interrupted safely.
 freeze_timeout_seconds=15

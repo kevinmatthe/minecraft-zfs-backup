@@ -29,11 +29,13 @@ Python 3.11+ is required. This build uses `java -m jdk.compiler/com.sun.tools.ja
 
 ## Configuration and commands
 
-Copy `local-zfs-backup.properties.example` to the dedicated server's `config/local-zfs-backup.properties` before startup. Missing configuration uses defaults: interval 3600 seconds, maximum freeze 15 seconds, mailbox `.zfs-snapshot-bridge` relative to server root. Restart to apply configuration. An invalid configuration disables the bridge and logs the reason.
+Copy `local-zfs-backup.properties.example` to the dedicated server's `config/local-zfs-backup.properties` before startup. Missing configuration uses defaults: interval 3600 seconds, maximum freeze 15 seconds, mailbox `.zfs-snapshot-bridge` relative to server root, and `only_if_players_been_online=true`. Restart to apply configuration. An invalid configuration disables the bridge and logs the reason.
 
 `interval_seconds` accepts 60..31536000; `freeze_timeout_seconds` accepts 1..15. `bridge_directory` must be relative and remain below server root. The host administrator must map the same mailbox directory into the host agent. Configure shared-directory permissions so the server and agent can read each other's files and publish atomic replacements.
 
-`/zfsbackup now` and `/zfsbackup status` require operator permission level 4. A manual request bypasses the ordinary interval, while respecting an existing request and the minimum 60-second failure/defer backoff. The host separately enforces its snapshot acceptance rate. The first automatic request occurs after a full interval; restarting the server starts a new interval.
+`/zfsbackup now` and `/zfsbackup status` require operator permission level 4. A manual request bypasses the ordinary interval, while respecting an existing request and the minimum 60-second failure/defer backoff. The host separately enforces its snapshot acceptance rate.
+
+With `only_if_players_been_online=true`, automatic checkpoints skip intervals with no player activity since the last successful checkpoint. Login and ticks with online players mark activity; pending activity remains after the last player leaves. Only a matching `COMMITTED` acknowledgement clears the generation captured when a checkpoint began. Failed checkpoints preserve it, and player activity during a checkpoint remains pending for the next backup. An empty freshly started server therefore skips automatic checkpoints; `/zfsbackup now` works regardless of activity. Set `only_if_players_been_online=false` to back up idle servers automatically. The setting accepts exactly `true` or `false`. Skipped automatic checkpoints schedule the next interval, and activity tracking starts fresh on server startup. The first automatic request occurs after a full interval; restarting the server starts a new interval.
 
 ## Save lifecycle and limits
 

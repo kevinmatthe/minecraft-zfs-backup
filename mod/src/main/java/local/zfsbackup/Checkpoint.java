@@ -22,6 +22,8 @@ public final class Checkpoint {
  private final Port port;
  private final LongSupplier clock,elapsed;
  private final long interval, timeout;
+ private final boolean onlyIfPlayersBeenOnline;
+ private long activityGeneration,successfulActivityGeneration,checkpointActivityGeneration;
  private State state=State.IDLE;
  private long due,startedElapsed;
  private Request request;
@@ -29,15 +31,26 @@ public final class Checkpoint {
  private volatile boolean barrierDone;
  private volatile Throwable barrierError;
  private String detail="waiting for first interval";
- public Checkpoint(Port p,LongSupplier clock,long interval,long timeout){this(p,clock,clock,interval,timeout);}
- public Checkpoint(Port p,LongSupplier clock,LongSupplier elapsed,long interval,long timeout) {
+ public Checkpoint(Port p,LongSupplier clock,long interval,long timeout){this(p,clock,clock,interval,timeout,true);}
+ public Checkpoint(Port p,LongSupplier clock,LongSupplier elapsed,long interval,long timeout){this(p,clock,elapsed,interval,timeout,true);}
+ public Checkpoint(Port p,LongSupplier clock,LongSupplier elapsed,long interval,long timeout,boolean onlyIfPlayersBeenOnline) {
   if(interval<60000||timeout<1000||timeout>15000)throw new IllegalArgumentException("interval >= 60s; freeze bound 1..15s");
-  this.port=p;this.clock=clock;this.elapsed=elapsed;this.interval=interval;this.timeout=timeout;due=elapsed.getAsLong()+interval;
+  this.port=p;this.clock=clock;this.elapsed=elapsed;this.interval=interval;this.timeout=timeout;
+  this.onlyIfPlayersBeenOnline=onlyIfPlayersBeenOnline;due=elapsed.getAsLong()+interval;
  }
+ /** Called on the server thread for online player activity; in-flight generations stay dirty. */
+ public void playerActivity(){if(state!=State.STOPPED)activityGeneration++;}
  public void tick() {
   if(state==State.STOPPED)return;
   long now=clock.getAsLong();
-  if(state==State.IDLE){if(elapsed.getAsLong()>=due)now();return;}
+  if(state==State.IDLE){
+   if(elapsed.getAsLong()>=due){
+    if(onlyIfPlayersBeenOnline&&activityGeneration==successfulActivityGeneration){
+     due=elapsed.getAsLong()+interval;detail="skipped automatic checkpoint: no player activity since last success";
+    }else now();
+   }
+   return;
+  }
   if(expired()){fail("checkpoint timed out");return;}
   try{
    if(state==State.BARRIER){
@@ -56,6 +69,7 @@ public final class Checkpoint {
     request=new Request(request.id(),"COMMIT",request.created(),request.deadline(),now);
     port.publish(request);state=State.COMMIT;detail="waiting for COMMITTED";
    }else if(state==State.COMMIT&&response.phase().equals("COMMITTED")){
+    successfulActivityGeneration=checkpointActivityGeneration;
     detail="last success: "+response.snapshot();state=State.IDLE;due=elapsed.getAsLong()+interval;request=null;
    }
   }catch(Exception e){fail("checkpoint failed: "+e);}
@@ -70,6 +84,7 @@ public final class Checkpoint {
    if(port.busy()){defer(clock.getAsLong(),"FTB backup active");return false;}
    now=clock.getAsLong();
    if(heartbeat==null||!heartbeat.ready()||heartbeat.updated()<now-5000||heartbeat.updated()>now+1000){defer(now,"host heartbeat unavailable or stale");return false;}
+   checkpointActivityGeneration=activityGeneration;
    startedElapsed=elapsed.getAsLong();
    request=new Request(UUID.randomUUID(),"FROZEN",now,now+timeout,0);
    state=State.BARRIER;barrierDone=false;barrierError=null;
@@ -92,5 +107,5 @@ public final class Checkpoint {
   request=null;state=State.IDLE;defer(clock.getAsLong(),message);
  }
  public void shutdown(){if(state!=State.STOPPED&&request!=null)fail("server stopping");restore();state=State.STOPPED;}
- public String status(){return state+"; "+detail+"; retry/interval remaining ms="+Math.max(0,due-elapsed.getAsLong());}
+ public String status(){return state+"; "+detail+"; activity_pending="+(activityGeneration!=successfulActivityGeneration)+"; retry/interval remaining ms="+Math.max(0,due-elapsed.getAsLong());}
 }

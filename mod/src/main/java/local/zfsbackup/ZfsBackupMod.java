@@ -8,6 +8,7 @@ import net.neoforged.fml.common.Mod;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.RegisterCommandsEvent;
+import net.neoforged.neoforge.event.entity.player.PlayerEvent;
 import net.neoforged.neoforge.event.server.ServerStartedEvent;
 import net.neoforged.neoforge.event.server.ServerStoppingEvent;
 import net.neoforged.neoforge.event.tick.ServerTickEvent;
@@ -29,6 +30,7 @@ public final class ZfsBackupMod {
   NeoForge.EVENT_BUS.addListener(this::tick);
   NeoForge.EVENT_BUS.addListener(this::stopping);
   NeoForge.EVENT_BUS.addListener(this::commands);
+  NeoForge.EVENT_BUS.addListener(this::loggedIn);
  }
  private void started(ServerStartedEvent event){
   MinecraftServer server=event.getServer();
@@ -39,15 +41,24 @@ public final class ZfsBackupMod {
    long interval=Long.parseLong(properties.getProperty("interval_seconds","3600"));
    long timeout=Long.parseLong(properties.getProperty("freeze_timeout_seconds","15"));
    if(interval<60||interval>31536000||timeout<1||timeout>15)throw new IllegalArgumentException("interval_seconds must be 60..31536000 and freeze_timeout_seconds 1..15");
+   String activitySetting=properties.getProperty("only_if_players_been_online","true").trim();
+   if(!activitySetting.equals("true")&&!activitySetting.equals("false"))throw new IllegalArgumentException("only_if_players_been_online must be true or false");
+   boolean onlyIfPlayersBeenOnline=Boolean.parseBoolean(activitySetting);
    Path relative=Path.of(properties.getProperty("bridge_directory",".zfs-snapshot-bridge"));
    Path bridge=root.resolve(relative).normalize();
    if(relative.isAbsolute()||!bridge.startsWith(root)||bridge.equals(root))throw new IllegalArgumentException("bridge_directory must be below the server root");
    mailbox=new AsyncMailbox(new Mailbox(bridge));
-   checkpoint=new Checkpoint(new ServerPort(server,mailbox),System::currentTimeMillis,()->System.nanoTime()/1_000_000,interval*1000,timeout*1000);
+   checkpoint=new Checkpoint(new ServerPort(server,mailbox),System::currentTimeMillis,()->System.nanoTime()/1_000_000,interval*1000,timeout*1000,onlyIfPlayersBeenOnline);
    LOG.info("ZFS checkpoint bridge enabled: interval {}s, maximum freeze {}s",interval,timeout);
   }catch(Exception e){LOG.error("ZFS bridge disabled: invalid configuration",e);}
  }
- private void tick(ServerTickEvent.Post event){if(checkpoint!=null)checkpoint.tick();}
+ private void loggedIn(PlayerEvent.PlayerLoggedInEvent event){if(checkpoint!=null)checkpoint.playerActivity();}
+ private void tick(ServerTickEvent.Post event){
+  if(checkpoint!=null){
+   if(event.getServer().getPlayerCount()>0)checkpoint.playerActivity();
+   checkpoint.tick();
+  }
+ }
  private void stopping(ServerStoppingEvent event){
   try{if(checkpoint!=null)checkpoint.shutdown();}
   finally{checkpoint=null;if(mailbox!=null){mailbox.close();mailbox=null;}}

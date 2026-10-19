@@ -4,11 +4,13 @@ agent_url=http://minecraft-zfs-agent:8765
 # Regular file containing >=32 printable non-space ASCII characters. Never put tokens here.
 # Relative paths resolve from server root; administrator-owned absolute paths are also allowed.
 agent_token_file=config/local-zfs-backup.token
-interval_seconds=3600
-# Total prepare + forced flush + optional asynchronous save barrier + snapshot response budget.
+# Automatic checkpoints follow successful vanilla autosaves; no independent interval.
+# Legacy interval_seconds is ignored.
+# Total prepare + save/queued-write barrier + snapshot response budget.
 freeze_timeout_seconds=15
-# Manual /zfsbackup save bypasses the idle gate; activity survives the last player's departure.
-only_if_players_been_online=true
+# Forced-loaded chunks can change without players; include those saves by default.
+# Set true only if skipping saves without player activity is intentional.
+only_if_players_been_online=false
 # Always send server_stopped; request a snapshot only after verified successful save/close
 # and according to the activity policy. Missing/failing shutdown instrumentation skips backup.
 # The host records the event but skips its snapshot during rollback maintenance.

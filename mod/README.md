@@ -1,6 +1,6 @@
 # NeoForge HTTP save checkpoint bridge
 
-Version 2.0.1 is a dedicated-server-only Java 21 mod for Minecraft 1.21.1 / NeoForge 21.1.251. It actively calls the companion's [HTTP API v1](../docs/http-api.md). Shared mailbox IPC from 1.x is removed. The mod never executes ZFS, Docker, shell commands, replication, or dataset selection.
+Version 2.1.0 is a dedicated-server-only Java 21 mod for Minecraft 1.21.1 / NeoForge 21.1.251. It actively calls the companion's [HTTP API v1](../docs/http-api.md). Shared mailbox IPC from 1.x is removed. The mod never executes ZFS, Docker, shell commands, replication, or dataset selection.
 
 ## Build and test
 
@@ -11,7 +11,7 @@ cd mod
 ./gradlew build
 ```
 
-The standard build pins ModDevGradle 2.0.148, NeoForge 21.1.251 and Gradle 8.14.3. The wrapper distribution has a pinned SHA-256. Gradle produces `build/libs/local-zfs-backup-1.21.1-2.0.1.jar`.
+The standard build pins ModDevGradle 2.1.048, NeoForge 21.1.251 and Gradle 8.14.3. The wrapper distribution has a pinned SHA-256. Gradle produces `build/libs/local-zfs-backup-1.21.1-2.1.0.jar`.
 
 The portable builder compiles and tests against existing matching server libraries, without downloading Minecraft dependencies:
 
@@ -25,7 +25,7 @@ Compilation can also run in an existing container. It reads server libraries and
 python3 build.py --container minecraft-test --server-dir /path/to/server --java /path/to/java21/bin/java
 ```
 
-Python 3.11+ is required. The builder invokes the JDK compiler module, puts mapped `*-srg.jar` files before remaining dependencies, runs executable Java tests, and produces `build/local-zfs-backup-1.21.1-2.0.1.jar`. Tests are excluded from the artifact. The test suite covers lifecycle failure/timeouts/stale callbacks, activity generations, dimension saving flags, command rendering, and a real loopback HTTP server with malformed responses, authorization errors, redirects and stalled response bodies. Gradle `check` runs the same tests.
+Python 3.11+ is required. The builder invokes the JDK compiler module, puts mapped `*-srg.jar` files before remaining dependencies, runs executable Java tests, and produces `build/local-zfs-backup-1.21.1-2.1.0.jar`. Tests are excluded from the artifact. The test suite covers lifecycle failure/timeouts/stale callbacks, activity generations, dimension saving flags, command rendering, and a real loopback HTTP server with malformed responses, authorization errors, redirects and stalled response bodies. Gradle `check` runs the same tests.
 
 ## Configuration
 
@@ -35,9 +35,9 @@ Copy `local-zfs-backup.properties.example` to the server's `config/local-zfs-bac
 | --- | --- | --- |
 | `agent_url` | `http://minecraft-zfs-agent:8765` | Private HTTP(S) origin, without credentials, path, query or fragment |
 | `agent_token_file` | `config/local-zfs-backup.token` | Regular file containing the bearer token; relative to server root or an administrator-specified absolute path |
-| `interval_seconds` | `3600` | Elapsed real time between automatic checkpoints; 60..31536000 |
+| `interval_seconds` | ignored | Legacy setting; automatic checkpoints follow successful vanilla autosaves |
 | `freeze_timeout_seconds` | `15` | Total prepare/save/snapshot budget; 1..15 |
-| `only_if_players_been_online` | `true` | Skip automatic checkpoints without player activity since the last successful checkpoint |
+| `only_if_players_been_online` | `false` | Skip automatic checkpoints without player activity since the last successful checkpoint |
 | `snapshot_on_shutdown` | `true` | Request an offline snapshot after verified successful shutdown saving/closure, respecting activity |
 
 Booleans accept exactly `true` or `false`. The token must contain at least 32 printable, non-space ASCII characters, with an optional trailing newline. Keep its file private and readable by the server UID. Tokens and authorization headers never enter logs or command output. Missing credentials or invalid configuration disables the bridge with a generic diagnostic. TLS uses the JVM's normal trust configuration. Redirects are disabled.
@@ -59,13 +59,13 @@ All commands require operator permission level 4:
 
 Running-server commands return immediately and deliver completed responses on the server thread. A rollback response is an accepted background job, not completion: the host agent handles stopping the server, verifying offline state and the world lock, recording recovery points, restoring the existing world dataset, then restarting through Crafty. Snapshot names complete with Tab after `/zfsbackup rollback `, including typed prefixes. Completion fetches only managed published snapshot names asynchronously from the agent; concurrent requests share a lookup and results are cached for 500 milliseconds. It performs no background polling or world operations. A disabled/unavailable agent or malformed response returns no snapshot suggestions, while the `status` subcommand remains available. Job progress remains available after restart. The mod also queries the latest job on each startup.
 
-Manual checkpoints cannot overlap another checkpoint or bypass the minimum 60-second failure/defer backoff. The host separately enforces its acceptance policy. Automatic scheduling starts after a full interval. An idle skip schedules the next interval. Login and ticks with online players advance an activity generation. Only matching `COMMITTED` clears the generation captured at checkpoint start; failed operations and activity during an in-flight checkpoint remain pending, including after the last player leaves. Activity tracking starts fresh when the server process starts.
+Manual checkpoints cannot overlap another checkpoint or bypass the minimum 60-second failure/defer backoff. The host separately enforces its acceptance policy. Automatic checkpoints follow whole successful vanilla autosave batches, normally about every five minutes at20TPS. There is no second timer or repeated save. If the optional idle filter is enabled, an idle batch is skipped and the next actual autosave is the next opportunity. Login and ticks with online players advance an activity generation. Only matching `COMMITTED` clears the generation captured at checkpoint start; failed operations and activity during an in-flight checkpoint remain pending, including after the last player leaves. Activity tracking starts fresh when the server process starts.
 
 ## Save and HTTP lifecycle
 
-The server thread starts an asynchronous `POST /v1/checkpoints` with `periodic_save` or `manual_save`. Saving stays enabled until a matching `PREPARED`. The mod then rechecks optional FTB backup activity, captures every dimension's prior `noSave`, disables saving, and calls `saveEverything(false, true, true)`.
+For `periodic_save`, the Mod observes the complete native `tickServer` autosave invocation, including its existing asynchronous-save integration. After a successful batch it captures saving flags and temporarily postpones new background save submissions while asynchronously preparing the HTTP operation. It does not call `saveEverything` a second time. For an explicit `manual_save`, preparation still precedes capturing flags and the single `saveEverything(false, true, true)` call.
 
-If installed, `local.asyncplayersave.AsyncPlayerSave.backupCheckpoint(MinecraftServer)` is invoked by reflection. Its completion schedules onto the server thread; the running game thread never calls `join` or `get`. A successful barrier sends the snapshot request. A matching `SNAPSHOT_READY` restores all captured saving flags before sending `commit`. Only matching `COMMITTED`, including the same snapshot identity, records success. Commit acknowledgement has a separate bounded wait while saving is enabled.
+If installed, `local.asyncplayersave.AsyncPlayerSave.backupCheckpoint(MinecraftServer)` is invoked by reflection. Its completion schedules onto the server thread, followed by nonblocking synchronization of the native chunk, POI and entity region workers across all dimensions. The running game thread never calls `join` or `get`. Background dirty/section-unload save submissions remain queued during capture and resume after flags are restored; gameplay continues. An observed save failure rejects the checkpoint even if its failed IO future already left the native pending queue. An external forced save cancels the frozen checkpoint before proceeding. A successful barrier sends the snapshot request. A matching `SNAPSHOT_READY` restores all captured saving flags before sending `commit`. Only matching `COMMITTED`, including the same snapshot identity, records success. Commit acknowledgement has a separate bounded wait while saving is enabled.
 
 The entire prepare/save/snapshot budget uses epoch deadlines and a monotonic elapsed-time guard. Preparation errors, HTTP failures, invalid responses, timeouts and shutdown attempt cancellation and restore all captured flags. A late response or barrier cannot revive a cancelled or newer request. Forced Minecraft flushing and synchronous hooks in other mods can still delay a tick; they cannot safely be interrupted. The deadline is checked immediately when control resumes.
 
@@ -80,3 +80,5 @@ The ordering was checked against the actual NeoForge 21.1.251 patched server JAR
 A narrow optional Mixin observes the actual pinned `stopServer` call sequence. It requires a successful `saveAllChunks` result, successful closure of every originally loaded dimension, successful storage closure and a normal method return, with no observed failure. Its wrappers preserve original arguments, return values and exception identities; vanilla retains its own exception handling. Missing injection targets, an absent Mixin or an incomplete sequence leave evidence false rather than authorizing a backup. The Mixin has no required injections and does not participate in ordinary HTTP checkpoints. It uses NeoForge's existing Mixin support without another dependency. Tests cover caught close exceptions, thrown/false saves and missing instrumentation/normal returns. This observes Minecraft's public save/close outcomes; an unrelated mod that silently hides its own write errors cannot provide positive durability evidence to this bridge.
 
 Validate the complete modpack on a disposable server before deployment; forced process termination cannot deliver an exit event.
+
+The checkpoint represents completed writes submitted by that autosave batch. It is not a transaction over all game memory or arbitrary third-party direct file writes. Independent logout saves keep their normal semantics. Snapshot completion and rollback use only the configured local dataset; remote retention and restore catalogs belong to separately configured storage tooling.

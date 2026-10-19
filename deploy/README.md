@@ -1,6 +1,6 @@
 # Docker deployment
 
-Install the Mod JAR into the Minecraft server's `mods` directory. Run the companion as a separate Docker Compose service. The Mod sends HTTP events and schedules checkpoints; the companion executes local ZFS operations. Native TrueNAS replication handles optional copies to Storage independently.
+Install the Mod JAR into the Minecraft server's `mods` directory. Run the companion as a separate Docker Compose service. The Mod sends HTTP events after completed autosave batches; the companion executes local ZFS operations. Optional off-host replication is configured separately. The native TrueNAS instructions describe one deployment, not a runtime dependency.
 
 Requirements: Linux Docker Compose, OpenZFS 2.3, an existing dedicated world dataset and Java21/NeoForge1.21.1. The image provides ZFS userspace tools; the host provides the kernel module. No cron job, systemd unit or host boot hook is installed.
 
@@ -21,7 +21,7 @@ Only the companion receives `/dev/zfs` and the capabilities listed in the exampl
 
 Preserve the world's exact absolute host path inside the companion: its preflight verifies that this path is the configured mounted ZFS dataset. A writable world bind is required for rollback; a snapshot-only deployment can use a read-only bind. The agent does not create or migrate your datasets.
 
-Once healthy, use `/zfsbackup save`, `/zfsbackup status` and `/zfsbackup list`. Automatic checkpoints default to hourly and skip periods without player activity. A separate server-stopped event can create a final checkpoint after the world closes. See [the HTTP contract](../docs/http-api.md) for timing and failure semantics.
+Once healthy, use `/zfsbackup save`, `/zfsbackup status` and `/zfsbackup list`. Automatic checkpoints follow successful vanilla autosaves, normally about every five minutes at20TPS, and include periods without player activity by default. There is no independent periodic forced save; the old interval_seconds property is ignored. A separate server-stopped event can create a final checkpoint after the world closes. See [the HTTP contract](../docs/http-api.md) for timing and failure semantics.
 
 ## Optional Crafty rollback
 

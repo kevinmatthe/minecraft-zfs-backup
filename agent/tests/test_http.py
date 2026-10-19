@@ -10,7 +10,7 @@ from minecraft_zfs_agent.coordinator import CheckpointService
 from minecraft_zfs_agent.http_service import AgentHTTPServer
 
 
-class HTTPTests(unittest.TestCase):
+class HTTPFixture(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();root=Path(self.tmp.name)
         self.service=CheckpointService(Config('tank/world',root/'world',root/'state',root/'token'),FakeZFS())
@@ -25,6 +25,9 @@ class HTTPTests(unittest.TestCase):
         connection.request(method,path.strip(),body=body,headers=h)
         response=connection.getresponse();data=response.read();connection.close()
         return response.status,json.loads(data)
+
+
+class HTTPTests(HTTPFixture):
     def test_all_v1_requires_auth_and_health_discloses_only_readiness(self):
         for path in ['/v1/status','/v1/snapshots','/v1/rollbacks/current']:
             status,value=self.request(path,token=False);self.assertEqual(status,401);self.assertIn('error',value)
@@ -53,4 +56,41 @@ class HTTPTests(unittest.TestCase):
         try:status,_=self.request('/healthz',token=False);self.assertEqual(status,503)
         finally:a.close();b.close()
 
+class ResumeHTTPTests(HTTPFixture):
+    def test_explicit_failed_job_resume_is_authenticated_and_strict(self):
+        import uuid
+        called=[]
+        class Manager:
+            def resume(self,id):called.append(id);return dict(id=id,phase='INTENT')
+        self.server.rollback=Manager();id=str(uuid.uuid4());path='/v1/rollbacks/'+id+'/resume'
+        status,_=self.request(path,'POST','{}',token=False);self.assertEqual(status,401);self.assertFalse(called)
+        status,_=self.request(path,'POST','{"snapshot":"other"}');self.assertEqual(status,400);self.assertFalse(called)
+        status,result=self.request(path,'POST','{}');self.assertEqual(status,202);self.assertEqual(called,[id]);self.assertEqual(result['phase'],'INTENT')
+
 if __name__=='__main__':unittest.main()
+
+class AbsoluteDeadlineTests(HTTPFixture):
+    def test_slow_drip_requestline_headers_body_and_shutdown_are_bounded(self):
+        import socket,time
+        self.server.read_timeout=.2
+        header=('POST /v1/checkpoints HTTP/1.1\r\nAuthorization: Bearer '+self.token+'\r\nContent-Length: 100\r\n\r\n').encode()
+        cases=[(b'',b'GET /v1/status HTTP/1.1\r\n'),
+               (b'GET /v1/status HTTP/1.1\r\n',b'X-Slow: '+b'x'*100),
+               (header,b'{'+b' '*98+b'}')]
+        for prefix,dripped in cases:
+            with self.subTest(prefix=bool(prefix),body=prefix.startswith(b'POST')):
+                sock=socket.create_connection(self.server.server_address);sock.settimeout(1)
+                if prefix:sock.sendall(prefix)
+                stopped=threading.Event()
+                def drip():
+                    try:
+                        for byte in dripped:sock.sendall(bytes([byte]));time.sleep(.025)
+                    except OSError:pass
+                    finally:stopped.set()
+                worker=threading.Thread(target=drip,daemon=True);start=time.monotonic();worker.start()
+                try:self.assertTrue(stopped.wait(.9),'Connection exceeded its absolute read deadline')
+                finally:sock.close();worker.join(1)
+                self.assertLess(time.monotonic()-start,1)
+        start=time.monotonic();self.server.shutdown();self.server.server_close()
+        self.assertLess(time.monotonic()-start,1)
+        self.assertFalse(self.service.backend.items)

@@ -28,7 +28,7 @@ services:
         source: ${WORLD_PATH:?Set exact dedicated world mount path}
         target: ${WORLD_PATH:?Set exact dedicated world mount path}
         read_only: ${WORLD_READ_ONLY:-false}
-        bind: {create_host_path: false}
+        bind: {create_host_path: false, propagation: rslave}
       - type: bind
         source: ${STATE_DIR:?Set private HTTP state directory}
         target: ${STATE_DIR:?Set private HTTP state directory}

@@ -5,6 +5,7 @@ import json
 import logging
 import socket
 import threading
+import time
 from urllib.parse import urlsplit
 from .protocol import APIError,MAX_MESSAGE,parse_json,object_fields,identifier
 from .zfs import OWNED
@@ -14,9 +15,10 @@ class AgentHTTPServer(ThreadingHTTPServer):
     daemon_threads=False
     block_on_close=True
     request_queue_size=16
-    def __init__(self,address,service,token,rollback=None,max_workers=8):
+    def __init__(self,address,service,token,rollback=None,max_workers=8,read_timeout=3):
         self.service,self.token,self.rollback=service,token.encode('utf-8'),rollback
         self.workers=threading.BoundedSemaphore(max_workers)
+        self.read_timeout=read_timeout
         super().__init__(address,Handler)
     def process_request(self,request,address):
         if not self.workers.acquire(blocking=False):
@@ -37,8 +39,21 @@ class Handler(BaseHTTPRequestHandler):
     server_version='MinecraftZFS/1'
     sys_version=''
     def setup(self):
-        self.request.settimeout(3)
+        self.request.settimeout(self.server.read_timeout)
+        self.read_deadline=time.monotonic()+self.server.read_timeout
+        self.read_timer=threading.Timer(self.server.read_timeout,self._expire_read)
+        self.read_timer.daemon=True
         super().setup()
+        self.read_timer.start()
+    def _expire_read(self):
+        try:self.request.shutdown(socket.SHUT_RDWR)
+        except OSError:pass
+    def _read_complete(self):
+        self.read_timer.cancel()
+        if time.monotonic()>=self.read_deadline:raise APIError(400,'read_timeout','Absolute request read deadline expired')
+    def finish(self):
+        self.read_timer.cancel()
+        super().finish()
     def log_message(self,*_):pass
     def reply(self,status,value):
         raw=json.dumps(value,separators=(',',':'),allow_nan=False).encode('utf-8')
@@ -51,11 +66,12 @@ class Handler(BaseHTTPRequestHandler):
         if length>MAX_MESSAGE:raise APIError(400,'body_too_large','JSON request exceeds16KiB')
         raw=self.rfile.read(length)
         if len(raw)!=length:raise APIError(400,'incomplete_body','Incomplete request body')
-        return parse_json(raw)
+        value=parse_json(raw);self._read_complete();return value
     def authorized(self):
         values=self.headers.get_all('Authorization',[])
         return len(values)==1 and hmac.compare_digest(values[0].encode('utf-8'),b'Bearer '+self.server.token)
     def route(self,method):
+        if method!='POST':self._read_complete()
         parsed=urlsplit(self.path);path=parsed.path
         if parsed.query or parsed.fragment:raise APIError(400,'invalid_path','Query parameters are unsupported')
         if path=='/healthz' and method=='GET':
@@ -81,6 +97,10 @@ class Handler(BaseHTTPRequestHandler):
             pieces=path.strip('/').split('/')
             if len(pieces)==4 and pieces[:2]==['v1','checkpoints'] and pieces[3] in ('snapshot','commit','cancel'):
                 return 200,getattr(service,pieces[3])(pieces[2],body)
+            if len(pieces)==4 and pieces[:2]==['v1','rollbacks'] and pieces[3]=='resume':
+                if self.server.rollback is None:raise APIError(503,'rollback_disabled','Crafty rollback is not configured')
+                identifier(pieces[2]);object_fields(body,set())
+                return 202,self.server.rollback.resume(pieces[2])
             if path=='/v1/rollbacks':
                 if self.server.rollback is None:raise APIError(503,'rollback_disabled','Crafty rollback is not configured')
                 object_fields(body,{'id','snapshot'});identifier(body['id'])

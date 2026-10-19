@@ -137,7 +137,8 @@ class CheckpointService:
         elif names.get(pending)==op['guid']:self.backend.rename(pending,name)
         else:raise APIError(409,'guid_conflict','Recorded pending snapshot missing or changed')
         op.update(state='COMMITTED',updated_ms=self.clock());op.pop('publish_intent',None)
-        self.ledger['active']=None;self.ledger['last_success']=self._public(op);self.save();self._schedule();self._prune()
+        if self.active_checkpoint is op:self.ledger['active']=None
+        self.ledger['last_success']=self._public(op);self.save();self._schedule();self._prune()
     def commit(self,id,body):
         with self.lock:
             self.expire();op=self._get(id)

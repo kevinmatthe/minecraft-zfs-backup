@@ -158,3 +158,27 @@ class PrepareBudgetTests(Fixture):
         with self.assertRaises(APIError) as error:self.prepare()
         self.assertEqual(error.exception.status,410)
         self.assertIsNone(self.service.active_checkpoint)
+
+class ReconcileIsolationTests(Fixture):
+    def test_lifecycle_publish_reconciliation_preserves_new_ready_checkpoint(self):
+        original=self.zfs.rename
+        self.zfs.rename=lambda old,new:(_ for _ in ()).throw(RuntimeError('rename unavailable'))
+        with self.assertRaises(RuntimeError):self.service.lifecycle(dict(id=str(uuid.uuid4()),event='server_stopped',created_ms=self.now,backup_requested=True))
+        self.zfs.rename=original
+        ready=self.freeze();self.service.close()
+        self.service=CheckpointService(self.config,self.zfs,lambda:self.now)
+        self.assertIsNotNone(self.service.active_checkpoint)
+        self.assertEqual(self.service.active_checkpoint['id'],self.body['id'])
+        self.assertIn('pending-'+ready['snapshot'],self.zfs.items)
+        self.assertEqual(self.commit()['state'],'COMMITTED')
+
+class SameIDReconcileTests(Fixture):
+    def test_lifecycle_publish_does_not_clear_checkpoint_even_when_ids_match(self):
+        original=self.zfs.rename
+        self.zfs.rename=lambda old,new:(_ for _ in ()).throw(RuntimeError('rename unavailable'))
+        with self.assertRaises(RuntimeError):self.service.lifecycle(dict(id=self.body['id'],event='server_stopped',created_ms=self.now,backup_requested=True))
+        self.zfs.rename=original
+        ready=self.freeze();self.service.close();self.service=CheckpointService(self.config,self.zfs,lambda:self.now)
+        self.assertIsNotNone(self.service.active_checkpoint)
+        self.assertIn('pending-'+ready['snapshot'],self.zfs.items)
+        self.assertEqual(self.commit()['state'],'COMMITTED')

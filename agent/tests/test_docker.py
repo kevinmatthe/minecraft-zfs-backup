@@ -25,6 +25,7 @@ class PackagingTests(unittest.TestCase):
         self.assertTrue(service['read_only'])
         volumes={v['source']:v for v in service['volumes']}
         self.assertEqual(set(volumes),{'/example/config.json','/example/world','/example/state','/example/secrets'})
+        self.assertEqual(volumes['/example/world']['bind'].get('propagation'),'rslave')
         self.assertEqual(volumes['/example/world']['target'],'/example/world');self.assertFalse(volumes['/example/world'].get('read_only',False))
         self.assertTrue(volumes['/example/secrets']['read_only']);self.assertTrue(volumes['/example/config.json']['read_only'])
         self.assertTrue(all(v['bind'].get('create_host_path',False) is False for v in volumes.values()))

@@ -14,7 +14,7 @@ class CraftyTests(unittest.TestCase):
     def client(self,responses):
         self.assertIsNotNone(CraftyClient,'Crafty integration must exist')
         class Fake(CraftyClient):
-            def request(this,method,path,body=None):
+            def request(this,method,path,body=None,*,deadline=None):
                 this.calls.append((method,path,body))
                 result=responses.pop(0)
                 if isinstance(result,Exception): raise result
@@ -60,5 +60,50 @@ class CraftyTests(unittest.TestCase):
                 with self.assertRaises(CraftyError) as error:c.settings()
             self.assertNotIn('secret',str(error.exception).lower())
             self.assertNotIn('SECRET BODY',str(error.exception))
+
+    def test_slow_drip_headers_and_body_obey_absolute_request_deadline(self):
+        import socketserver
+        import threading
+        import time
+        from types import SimpleNamespace
+        for mode in ('headers','body','stop_budget','start_budget'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as folder:
+                token=Path(folder)/'token';token.write_text('test-token-value-that-is-long-enough');token.chmod(0o600)
+                class Drip(socketserver.BaseRequestHandler):
+                    def handle(this):
+                        this.request.settimeout(1)
+                        data=b''
+                        while b'\r\n\r\n' not in data:
+                            data+=this.request.recv(4096)
+                        body=b'{"status":"ok","data":{}}'
+                        header=b'HTTP/1.1 200 OK\r\nContent-Length: '+str(len(body)).encode()+b'\r\n\r\n'
+                        try:
+                            if mode=='headers':
+                                for byte in header:
+                                    this.request.sendall(bytes([byte]));time.sleep(0.02)
+                                this.request.sendall(body)
+                            else:
+                                this.request.sendall(header)
+                                for byte in body:
+                                    this.request.sendall(bytes([byte]));time.sleep(0.02)
+                        except OSError:pass
+                class Server(socketserver.ThreadingTCPServer):
+                    allow_reuse_address=True
+                    daemon_threads=True
+                server=Server(('127.0.0.1',0),Drip)
+                worker=threading.Thread(target=server.serve_forever,kwargs={'poll_interval':0.01},daemon=True);worker.start()
+                try:
+                    c=CraftyClient(SimpleNamespace(base_url='http://127.0.0.1:'+str(server.server_address[1]),server_id='test',token_file=token,
+                        verify_tls=True,ca_file=None,stop_timeout_seconds=0.12,start_timeout_seconds=0.12))
+                    c.request_timeout=0.12 if mode in ('headers','body') else 10
+                    start=time.monotonic()
+                    with self.assertRaises(CraftyError):
+                        if mode=='stop_budget':c.wait_stopped({'stats_id':1,'created':'2026-01-01T00:00:00','running':True})
+                        elif mode=='start_budget':c.wait_started({'stats_id':1,'created':'2026-01-01T00:00:00','running':False})
+                        else:c.request('GET','/stats')
+                    elapsed=time.monotonic()-start
+                    self.assertLess(elapsed,0.35,'dripping bytes must not extend elapsed budget')
+                finally:
+                    server.shutdown();server.server_close();worker.join(1)
 
 if __name__ == '__main__': unittest.main()

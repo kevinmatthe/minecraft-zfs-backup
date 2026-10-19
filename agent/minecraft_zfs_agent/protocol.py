@@ -58,34 +58,34 @@ def atomic_json(path, value, mode=0o644):
         temporary.unlink(missing_ok=True)
 
 
-def validate_request(value, now):
-    common = {'protocol', 'id', 'phase', 'created_ms', 'deadline_ms'}
-    if not isinstance(value, dict):
-        raise ValueError('request must be an object')
-    phase = value.get('phase')
-    extras = {'FROZEN':set(), 'COMMIT':{'committed_ms'}, 'CANCEL':{'cancelled_ms'}}
-    if not isinstance(phase, str) or phase not in extras or set(value) != common | extras[phase]:
-        raise ValueError('unknown phase or request fields')
-    if type(value['protocol']) is not int or value['protocol'] != 1:
-        raise ValueError('unsupported protocol')
-    identifier = value['id']
-    if not isinstance(identifier, str): raise ValueError('id must be a UUID')
+class APIError(Exception):
+    def __init__(self,status,code,message):
+        self.status,self.code,self.message=status,code,message
+        super().__init__(message)
+
+
+def object_fields(value,fields):
+    if not isinstance(value,dict) or set(value)!=set(fields):raise APIError(400,'invalid_fields','Unexpected or missing JSON fields')
+    return value
+
+
+def identifier(value):
     try:
-        if str(uuid.UUID(identifier)) != identifier: raise ValueError('id must be canonical lowercase UUID')
-    except (ValueError, AttributeError) as error:
-        raise ValueError('invalid UUID') from error
-    for name in {'created_ms', 'deadline_ms'} | extras[phase]:
-        if type(value[name]) is not int or value[name] < 0 or value[name] > 2**63-1:
-            raise ValueError('timestamp must be a nonnegative integer')
-    created, deadline = value['created_ms'], value['deadline_ms']
-    if created > now+1000 or not 0 < deadline-created <= MAX_FREEZE_MS:
-        raise ValueError('invalid request window')
-    if phase == 'FROZEN' and now >= deadline:
-        raise ValueError('FROZEN request expired')
-    if phase == 'COMMIT':
-        committed = value['committed_ms']
-        if not created <= committed <= deadline or committed > now+1000 or now > deadline+COMMIT_GRACE_MS:
-            raise ValueError('COMMIT outside permitted window')
-    if phase == 'CANCEL' and (value['cancelled_ms'] < created or value['cancelled_ms'] > now+1000 or now > deadline+COMMIT_GRACE_MS):
-        raise ValueError('invalid cancellation time')
+        if not isinstance(value,str) or str(uuid.UUID(value))!=value:raise ValueError()
+    except (ValueError,AttributeError):raise APIError(400,'invalid_id','Canonical lowercase UUID required') from None
+    return value
+
+
+def timestamp(value):
+    if type(value) is not int or not 0<=value<=2**63-1:raise APIError(400,'invalid_timestamp','Integer Unix milliseconds required')
+    return value
+
+
+def parse_json(raw):
+    if len(raw)>MAX_MESSAGE:raise APIError(400,'body_too_large','JSON request exceeds16KiB')
+    try:
+        value=json.loads(raw.decode('utf-8'),object_pairs_hook=_object,
+                         parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+        if not isinstance(value,dict):raise ValueError()
+    except (ValueError,UnicodeError,RecursionError):raise APIError(400,'invalid_json','Valid UTF-8 JSON object required') from None
     return value

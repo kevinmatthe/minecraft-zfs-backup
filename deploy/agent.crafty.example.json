@@ -1,0 +1,19 @@
+{
+  "source_dataset": "tank/minecraft-world",
+  "world_path": "/srv/minecraft/world",
+  "state_dir": "/srv/minecraft-backup/http-state",
+  "api_token_file": "/srv/minecraft-backup/secrets/agent.token",
+  "keep": 24,
+  "min_interval_seconds": 60,
+  "listen_host": "0.0.0.0",
+  "listen_port": 8765,
+  "crafty": {
+    "base_url": "https://crafty.local:8443",
+    "server_id": "00000000-0000-0000-0000-000000000000",
+    "token_file": "/srv/minecraft-backup/secrets/crafty.token",
+    "verify_tls": true,
+    "ca_file": "/srv/minecraft-backup/secrets/crafty-ca.pem",
+    "stop_timeout_seconds": 180,
+    "start_timeout_seconds": 180
+  }
+}

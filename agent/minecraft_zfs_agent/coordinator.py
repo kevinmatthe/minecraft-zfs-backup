@@ -1,187 +1,249 @@
-"""Persistent, fenced local checkpoint lifecycle and hold-aware retention."""
-from datetime import datetime, timezone
+"""Durable event-driven checkpoint service and rollback maintenance gate."""
+from datetime import datetime,timezone
+import copy
 import logging
 import os
-from .protocol import atomic_json, read_json, validate_request, COMMIT_GRACE_MS
+import threading
+import time
+from .protocol import APIError,atomic_json,read_json,object_fields,identifier,timestamp
+from .zfs import OWNED,PENDING
+from .offline_lock import OfflineWorldLock
 
 
-class Coordinator:
-    def __init__(self, config, backend, clock, publish_heartbeat=True):
-        self.config, self.backend, self.clock = config, backend, clock
-        self.publish_heartbeat = publish_heartbeat
-        config.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        info = config.state_dir.lstat()
-        if config.state_dir.is_symlink() or info.st_uid != os.geteuid() or info.st_mode & 0o077:
-            raise ValueError('state_dir must be agent-owned with permissions 0700')
-        self.ledger_path = config.state_dir/'ledger.json'
-        try: self.ledger = read_json(self.ledger_path, limit=1024*1024)
-        except FileNotFoundError:
-            self.ledger = {'version':1, 'pending':None, 'completed':{}, 'last_accepted_ms':None}
-        if self.ledger.get('version') != 1 or set(self.ledger) != {'version','pending','completed','last_accepted_ms'}:
-            raise ValueError('invalid ledger; manual review required')
-        self._resume = True
-        self._retention_due = True
-
-    def expire(self):
-        pending = self.ledger['pending']
-        if pending:
-            grace = COMMIT_GRACE_MS if pending.get('ready') else 0
-            if self.clock() > pending['deadline_ms'] + grace:
-                self.cleanup()
-
-    def save(self): atomic_json(self.ledger_path, self.ledger, mode=0o600)
-
-    def respond(self, identifier, phase, **extra):
-        atomic_json(self.config.mailbox_path/'response.json',
-                    dict(protocol=1, id=identifier, phase=phase, updated_ms=self.clock(), **extra))
-
-    def request(self):
-        return validate_request(read_json(self.config.mailbox_path/'request.json'), self.clock())
-
-    @staticmethod
-    def matches(pending, message):
-        return all(pending[field] == message[field] for field in ('id','created_ms','deadline_ms'))
-
-    def cleanup(self):
-        pending = self.ledger['pending']
-        if pending:
-            name = 'pending-'+pending['snapshot']
-            actual = dict(self.backend.snapshots(self.config.source_dataset)).get(name)
-            if actual is not None and pending.get('guid') and actual != pending['guid']:
-                raise RuntimeError('pending GUID changed; refusing to destroy replacement')
+class CheckpointService:
+    def __init__(self,config,backend,clock=None):
+        self.config,self.backend,self.clock=config,backend,clock or (lambda:time.time_ns()//1_000_000)
+        self.lock=threading.RLock();self.maintenance_owner=None;self.rollback=None
+        self.stop=threading.Event();self._timer=None
+        config.state_dir.mkdir(parents=True,exist_ok=True,mode=0o700)
+        info=config.state_dir.lstat()
+        if config.state_dir.is_symlink() or info.st_uid!=os.geteuid() or info.st_mode&0o077:raise ValueError('state must be agent-owned mode0700')
+        self.path=config.state_dir/'ledger.json'
+        try:self.ledger=read_json(self.path,limit=2*1024*1024)
+        except FileNotFoundError:self.ledger=dict(version=2,active=None,operations={},lifecycle={},recovery={},last_accepted_ms=None,last_success=None,last_error=None)
+        if self.ledger.get('version')!=2:raise ValueError('use a new HTTP state directory')
+        self._reconcile()
+    def save(self):atomic_json(self.path,self.ledger,mode=0o600)
+    def close(self):
+        self.stop.set()
+        if self._timer:self._timer.cancel()
+    @property
+    def active_checkpoint(self):
+        return self.ledger['operations'].get(self.ledger['active'])
+    def _copy(self,value):return copy.deepcopy(value)
+    def _public(self,op):
+        return self._copy({k:v for k,v in op.items() if k!='publish_intent'})
+    def _bounded(self,collection):
+        while len(collection)>256:
+            oldest=next(iter(collection))
+            if oldest==self.ledger['active']:break
+            del collection[oldest]
+    def _preflight(self):
+        try:self.backend.preflight()
+        except Exception:raise APIError(503,'source_unavailable','Configured world dataset is unavailable') from None
+    def _schedule(self):
+        if self._timer:self._timer.cancel()
+        active=self.active_checkpoint
+        if not active or self.stop.is_set():return
+        grace=60000 if active['state']=='SNAPSHOT_READY' else 0
+        delay=max(.001,(active['deadline_ms']+grace-self.clock()+1)/1000)
+        self._timer=threading.Timer(delay,self._timer_expire);self._timer.daemon=True;self._timer.start()
+    def _timer_expire(self):
+        try:self.expire()
+        except Exception:logging.exception('checkpoint deadline cleanup failed')
+    def _cleanup(self,op,state):
+        if op.get('snapshot'):
+            name='pending-'+op['snapshot'];actual=dict(self.backend.snapshots()).get(name)
+            if actual is not None and op.get('guid') and actual!=op['guid']:raise APIError(409,'guid_conflict','Pending snapshot GUID changed')
             self.backend.destroy_pending(name)
-            self.ledger['pending'] = None
-            self.save()
-
-    def complete(self, pending):
-        """A durable publish intent contains a previously validated COMMIT and GUID."""
-        snapshots = dict(self.backend.snapshots(self.config.source_dataset))
-        name = pending['snapshot']; temporary = 'pending-'+name
-        if snapshots.get(name) == pending['guid']:
-            if temporary in snapshots:
-                raise RuntimeError('both pending and published snapshots exist; refusing ambiguity')
-        elif name in snapshots:
-            raise RuntimeError('published snapshot GUID conflict')
-        elif snapshots.get(temporary) == pending['guid']:
-            self.backend.rename(temporary, name)
-        else:
-            raise RuntimeError('recorded pending snapshot missing or GUID changed')
-        record = {key:pending[key] for key in ('id','created_ms','deadline_ms','snapshot','guid')}
-        self.ledger['completed'][pending['id']] = record
-        # Keep idempotence records bounded. Ancient requests fail timestamp validation.
-        if len(self.ledger['completed']) > 256:
-            oldest = next(iter(self.ledger['completed']))
-            del self.ledger['completed'][oldest]
-        self.ledger['pending'] = None
+        op.update(state=state,updated_ms=self.clock());self.ledger['active']=None;self.save();self._schedule()
+    def expire(self):
+        with self.lock:
+            active=self.active_checkpoint
+            if active and not active.get('publish_intent'):
+                grace=60000 if active['state']=='SNAPSHOT_READY' else 0
+                if self.clock()>active['deadline_ms']+grace:self._cleanup(active,'EXPIRED')
+            self._schedule()
+    def _reconcile(self):
+        with self.lock:
+            active=self.active_checkpoint
+            if active and active.get('publish_intent'):self._publish(active)
+            for record in self.ledger['lifecycle'].values():
+                if record.get('publish_intent'):self._publish(record)
+            self.expire()
+            active=self.active_checkpoint;protected='pending-'+active['snapshot'] if active and active.get('snapshot') else None
+            for name,_ in self.backend.snapshots():
+                if PENDING.fullmatch(name) and name!=protected:self.backend.destroy_pending(name)
+            if active and active['state']=='SNAPSHOTTING':
+                # No acknowledged frozen barrier survives an interrupted snapshot request.
+                self._cleanup(active,'EXPIRED')
+            self._schedule()
+    def _window(self,body):
+        object_fields(body,{'id','event','created_ms','deadline_ms'});identifier(body['id'])
+        if body['event'] not in ('manual_save','periodic_save'):raise APIError(400,'invalid_event','Unsupported checkpoint event')
+        created,deadline=timestamp(body['created_ms']),timestamp(body['deadline_ms'])
+        if created>self.clock()+1000 or not 0<deadline-created<=60000:raise APIError(400,'invalid_window','Invalid freeze window')
+    def _get(self,id):
+        identifier(id);op=self.ledger['operations'].get(id)
+        if not op:raise APIError(404,'unknown_checkpoint','Unknown checkpoint ID')
+        return op
+    def _phase_time(self,op,body,key,commit=False):
+        object_fields(body,{key});value=timestamp(body[key])
+        if key in op and value!=op[key]:raise APIError(409,'identity_conflict','Operation timing cannot change')
+        if not op['created_ms']<=value<=op['deadline_ms'] or value>self.clock()+1000:raise APIError(400,'invalid_timestamp','Timestamp outside original window')
+        if commit and self.clock()>op['deadline_ms']+60000:raise APIError(410,'expired','Commit receipt window expired')
+        return value
+    def prepare(self,body):
+        with self.lock:
+            self._window(body);self.expire()
+            existing=self.ledger['operations'].get(body['id'])
+            if existing:
+                if any(existing[k]!=v for k,v in body.items()):raise APIError(409,'identity_conflict','Checkpoint identity cannot change')
+                return self._public(existing)
+            if self.maintenance_owner or self.active_checkpoint:raise APIError(409,'busy','Checkpoint or rollback already active')
+            if self.clock()>=body['deadline_ms']:raise APIError(410,'expired','Freeze budget expired')
+            self._preflight()
+            if self.clock()>=body['deadline_ms']:raise APIError(410,'expired','Source preparation exceeded freeze budget')
+            previous=self.ledger['last_accepted_ms']
+            if previous is not None and self.clock()-previous<self.config.min_interval_seconds*1000:raise APIError(409,'rate_limited','Minimum checkpoint interval has not elapsed')
+            op=body|dict(state='PREPARED',updated_ms=self.clock())
+            self.ledger['operations'][body['id']]=op;self.ledger['active']=body['id'];self.ledger['last_accepted_ms']=self.clock()
+            self._bounded(self.ledger['operations']);self.save();self._schedule();return self._public(op)
+    def _name(self,created):
+        names=dict(self.backend.snapshots());stamp=created//1000
+        for _ in range(300):
+            name=datetime.fromtimestamp(stamp,timezone.utc).strftime('mc-hourly-%Y%m%dT%H%M%SZ')
+            if name not in names and 'pending-'+name not in names:return name
+            stamp+=1
+        raise APIError(409,'name_conflict','No checkpoint name available')
+    def snapshot(self,id,body):
+        with self.lock:
+            self.expire();op=self._get(id);frozen=self._phase_time(op,body,'frozen_ms')
+            if op['state'] in ('COMMITTED','SNAPSHOT_READY'):return self._public(op)
+            if op['state']=='EXPIRED':raise APIError(410,'expired','Checkpoint expired')
+            if op['state']!='PREPARED' or self.ledger['active']!=id:raise APIError(409,'invalid_state','Checkpoint is not prepared')
+            if self.clock()>=op['deadline_ms']:self._cleanup(op,'EXPIRED');raise APIError(410,'expired','Freeze budget expired')
+            self._preflight();op.update(state='SNAPSHOTTING',snapshot=self._name(op['created_ms']),frozen_ms=frozen,updated_ms=self.clock());self.save()
+            self.backend.snapshot('pending-'+op['snapshot']);op['guid']=self.backend.guid('pending-'+op['snapshot']);self.save()
+            if self.clock()>=op['deadline_ms']:self._cleanup(op,'EXPIRED');raise APIError(410,'expired','Snapshot completed after deadline')
+            op.update(state='SNAPSHOT_READY',updated_ms=self.clock());self.save()
+            if self.clock()>=op['deadline_ms']:self._cleanup(op,'EXPIRED');raise APIError(410,'expired','Snapshot acknowledgement budget expired')
+            self._schedule();return self._public(op)
+    def _publish(self,op):
+        names=dict(self.backend.snapshots());name=op['snapshot'];pending='pending-'+name
+        if names.get(name)==op['guid']:
+            if pending in names:raise APIError(409,'guid_conflict','Ambiguous pending and published names')
+        elif name in names:raise APIError(409,'guid_conflict','Published snapshot GUID conflict')
+        elif names.get(pending)==op['guid']:self.backend.rename(pending,name)
+        else:raise APIError(409,'guid_conflict','Recorded pending snapshot missing or changed')
+        op.update(state='COMMITTED',updated_ms=self.clock());op.pop('publish_intent',None)
+        self.ledger['active']=None;self.ledger['last_success']=self._public(op);self.save();self._schedule();self._prune()
+    def commit(self,id,body):
+        with self.lock:
+            self.expire();op=self._get(id)
+            if op['state']=='COMMITTED' or op.get('publish_intent'):
+                object_fields(body,{'committed_ms'})
+                if timestamp(body['committed_ms'])!=op['committed_ms']:raise APIError(409,'identity_conflict','Commit timing cannot change')
+                if op.get('publish_intent'):self._publish(op)
+                return self._public(op)
+            committed=self._phase_time(op,body,'committed_ms',commit=True)
+            if op['state']=='EXPIRED':raise APIError(410,'expired','Checkpoint expired')
+            if op['state']!='SNAPSHOT_READY' or self.ledger['active']!=id:raise APIError(409,'invalid_state','No ready pending checkpoint')
+            self._preflight()
+            if self.backend.guid('pending-'+op['snapshot'])!=op['guid']:raise APIError(409,'guid_conflict','Pending GUID changed')
+            op.update(committed_ms=committed,publish_intent=True,state='PUBLISHING',updated_ms=self.clock());self.save();self._publish(op);return self._public(op)
+    def cancel(self,id,body):
+        with self.lock:
+            self.expire();op=self._get(id);object_fields(body,{'cancelled_ms'});cancelled=timestamp(body['cancelled_ms'])
+            if cancelled<op['created_ms'] or cancelled>self.clock()+1000:raise APIError(400,'invalid_timestamp','Invalid cancellation timestamp')
+            if 'cancelled_ms' in op and op['cancelled_ms']!=cancelled:raise APIError(409,'identity_conflict','Cancellation timing cannot change')
+            if op['state'] in ('COMMITTED','CANCELLED','EXPIRED'):return self._public(op)
+            if op.get('publish_intent'):self._publish(op);return self._public(op)
+            op['cancelled_ms']=cancelled;self._cleanup(op,'CANCELLED');return self._public(op)
+    def enter_maintenance(self,job_id):
+        with self.lock:
+            identifier(job_id);self.expire()
+            if self.maintenance_owner==job_id:return
+            if self.maintenance_owner or self.active_checkpoint:raise APIError(409,'busy','Checkpoint or rollback already active')
+            self.maintenance_owner=job_id
+    def leave_maintenance(self,job_id):
+        with self.lock:
+            if self.maintenance_owner!=job_id:raise APIError(409,'maintenance_conflict','Maintenance belongs to another job')
+            self.maintenance_owner=None
+            self._trim_recovery()
+    def _trim_recovery(self):
+        collection=self.ledger['recovery']
+        if len(collection)<=256:return
+        names=dict(self.backend.snapshots())
+        for key,record in list(collection.items()):
+            if len(collection)<=256:break
+            if record['id']==self.maintenance_owner or record['state']!='RECORDED':continue
+            if record['snapshot'] in names and (not hasattr(self.backend,'holds') or self.backend.holds(record['snapshot'])):continue
+            del collection[key]
         self.save()
-        self._retention_due = True
-        self.respond(pending['id'], 'COMMITTED', snapshot=name)
+    def record_recovery(self,event,job_id):
+        with self.lock:
+            if self.maintenance_owner!=job_id or event not in ('pre_rollback','rollback_completed'):raise APIError(409,'maintenance_required','Recovery requires matching maintenance')
+            key=job_id+':'+event;record=self.ledger['recovery'].get(key)
+            if record is None:
+                record=dict(snapshot=self._name(self.clock()),event=event,id=job_id,updated_ms=self.clock(),state='CREATING')
+                self.ledger['recovery'][key]=record;self.save()
+            names=dict(self.backend.snapshots())
+            if record['snapshot'] not in names:
+                if record.get('guid'):raise APIError(409,'guid_conflict','Recorded recovery point is missing')
+                self.backend.snapshot(record['snapshot']);names=dict(self.backend.snapshots())
+            guid=names[record['snapshot']]
+            if record.get('guid') and record['guid']!=guid:raise APIError(409,'guid_conflict','Recovery GUID changed')
+            self.backend.hold(record['snapshot'],'minecraft-zfs-rollback-'+job_id)
+            if self.backend.guid(record['snapshot'])!=guid:raise APIError(409,'guid_conflict','Recovery GUID changed while acquiring hold')
+            record.update(guid=guid,state='RECORDED');self._trim_recovery();self.save();return self._copy(record)
+    def lifecycle(self,body):
+        with self.lock:
+            object_fields(body,{'id','event','created_ms','backup_requested'});identifier(body['id']);created=timestamp(body['created_ms'])
+            if body['event'] not in ('server_started','server_stopped') or type(body['backup_requested']) is not bool:raise APIError(400,'invalid_event','Invalid lifecycle event')
+            if created>self.clock()+1000 or self.clock()-created>300000:raise APIError(400,'invalid_timestamp','Lifecycle event is stale or future')
+            if body['event']=='server_started' and body['backup_requested']:raise APIError(400,'invalid_event','Started event cannot request backup')
+            old=self.ledger['lifecycle'].get(body['id'])
+            if old:
+                if any(old[k]!=v for k,v in body.items()):raise APIError(409,'identity_conflict','Lifecycle identity cannot change')
+                if old['state']!='CREATING':return self._public(old)
+            record=old or body|dict(state='RECORDED',updated_ms=self.clock())
+            self.ledger['lifecycle'][body['id']]=record;self._bounded(self.ledger['lifecycle']);self.save()
+            if not body['backup_requested']:return self._public(record)
+            self.expire()
+            if self.maintenance_owner or self.active_checkpoint:
+                record.update(state='SKIPPED',reason='maintenance_or_checkpoint_active');self.save();return self._public(record)
+            self._preflight()
+            try:world_lock=OfflineWorldLock(self.config.world_path);world_lock.__enter__()
+            except OSError:
+                record.update(state='SKIPPED',reason='world_not_confirmed_stopped',updated_ms=self.clock());self.save();return self._public(record)
+            try:
+                if not record.get('snapshot'):record.update(state='CREATING',snapshot=self._name(created));self.save()
+                names=dict(self.backend.snapshots());name=record['snapshot'];pending='pending-'+name
+                if pending not in names and name not in names:self.backend.snapshot(pending)
+                names=dict(self.backend.snapshots());guid=names.get(pending,names.get(name))
+                if record.get('guid') and record['guid']!=guid:raise APIError(409,'guid_conflict','Lifecycle snapshot GUID changed')
+                world_lock.check()
+                record.update(guid=guid,publish_intent=True,state='PUBLISHING',updated_ms=self.clock());self.save();self._publish(record)
+                return self._public(record)
+            finally:world_lock.__exit__(None,None,None)
 
-    def tick(self):
-        ready = True
-        try: self.backend.preflight()
-        except Exception:
-            ready = False
-            logging.exception('source preflight failed')
-        if self.publish_heartbeat:
-            atomic_json(self.config.mailbox_path/'heartbeat.json', dict(protocol=1, updated_ms=self.clock(), ready=ready))
-        if not ready: return
-        try:
-            if self._resume:
-                from .zfs import PENDING
-                active = self.ledger['pending']
-                protected = 'pending-'+active['snapshot'] if active else None
-                for name, _ in self.backend.snapshots(self.config.source_dataset):
-                    if PENDING.fullmatch(name) and name != protected:
-                        self.backend.destroy_pending(name)
-                self._resume = False
-            pending = self.ledger['pending']
-            if pending and pending.get('publish_intent'):
-                self.complete(pending)
-            try: message = self.request()
-            except (ValueError, OSError):
-                self.expire()
-                return
-            completed = self.ledger['completed'].get(message['id'])
-            if completed:
-                if message['phase'] == 'COMMIT' and self.matches(completed, message):
-                    self.respond(message['id'], 'COMMITTED', snapshot=completed['snapshot'])
-                return
-            pending = self.ledger['pending']
-            if pending and not self.matches(pending, message):
-                # Only a newer valid FROZEN can supersede; unrelated COMMIT/CANCEL cannot.
-                if message['phase']=='FROZEN' and message['id'] != pending['id'] and message['created_ms'] >= pending['created_ms']:
-                    self.cleanup(); pending=None
-                else:
-                    if self.clock() > pending['deadline_ms']+COMMIT_GRACE_MS: self.cleanup()
-                    return
-            if message['phase']=='CANCEL':
-                if pending: self.cleanup()
-                return
-            if message['phase']=='COMMIT':
-                if not pending or not pending.get('guid'):
-                    self.respond(message['id'],'ERROR',error='no matching recorded pending snapshot')
-                    return
-                snapshots=dict(self.backend.snapshots(self.config.source_dataset))
-                if snapshots.get('pending-'+pending['snapshot']) != pending['guid']:
-                    raise RuntimeError('pending GUID mismatch; refusing publication')
-                pending['publish_intent'] = dict(committed_ms=message['committed_ms'], received_ms=self.clock())
-                self.save()
-                self.complete(pending)
-                return
-            if pending is None:
-                previous=self.ledger['last_accepted_ms']
-                if previous is not None and self.clock()-previous < self.config.min_interval_seconds*1000:
-                    self.respond(message['id'],'ERROR',error='host minimum snapshot interval has not elapsed')
-                    return
-                name=datetime.fromtimestamp(message['created_ms']/1000,timezone.utc).strftime('mc-hourly-%Y%m%dT%H%M%SZ')
-                snapshots=dict(self.backend.snapshots(self.config.source_dataset))
-                if name in snapshots or 'pending-'+name in snapshots:
-                    self.respond(message['id'],'ERROR',error='snapshot name collision')
-                    return
-                pending={key:message[key] for key in ('id','created_ms','deadline_ms')}
-                pending.update(snapshot=name, guid=None)
-                self.ledger['pending']=pending
-                self.ledger['last_accepted_ms']=self.clock()
-                self.save()  # Intent exists durably before ZFS snapshot command.
-            snapshots=dict(self.backend.snapshots(self.config.source_dataset))
-            if 'pending-'+pending['snapshot'] not in snapshots:
-                self.backend.snapshot('pending-'+pending['snapshot'])
-                snapshots=dict(self.backend.snapshots(self.config.source_dataset))
-            guid=snapshots.get('pending-'+pending['snapshot'])
-            if not guid or (pending['guid'] and pending['guid'] != guid):
-                raise RuntimeError('pending snapshot GUID mismatch')
-            pending['guid']=guid; self.save()
-            try: current=self.request()
-            except (ValueError,OSError):
-                if pending.get('ready'): self.expire()
-                else: self.cleanup()
-                return
-            if current['phase']!='FROZEN' or current != message:
-                if self.matches(pending,current) and current['phase']=='COMMIT':
-                    return  # Process the valid commit on the next poll.
-                if pending.get('ready') and not self.matches(pending,current):
-                    self.expire()  # Unrelated messages cannot cancel an acknowledged checkpoint.
-                    return
-                self.cleanup()
-                return
-            pending['ready']=True
-            self.save()
-            self.respond(message['id'],'SNAPSHOT_READY',snapshot=pending['snapshot'])
-        except Exception as error:
-            logging.exception('checkpoint coordination failed')
-            pending=self.ledger['pending']
-            if pending: self.respond(pending['id'],'ERROR',error=str(error)[:512])
-        finally:
-            if self._retention_due and self.ledger['pending'] is None:
-                result = dict(updated_ms=self.clock(), success=False)
-                try:
-                    result.update(self.backend.prune())
-                    result['success'] = True
-                    self._retention_due = False
-                except Exception as error:
-                    result['error'] = str(error)[:512]
-                    logging.exception('local retention failed; published snapshots remain valid')
-                try: atomic_json(self.config.state_dir/'retention.json', result, mode=0o600)
-                except OSError: logging.exception('retention status persistence failed')
+    def _prune(self):
+        if self.maintenance_owner:return
+        try:result=self.backend.prune();result.update(success=True,updated_ms=self.clock())
+        except Exception:result=dict(success=False,updated_ms=self.clock(),error='Local retention failed');logging.exception('local retention failed')
+        atomic_json(self.config.state_dir/'retention.json',result,mode=0o600)
+    def status(self):
+        with self.lock:
+            self.expire()
+            try:self._preflight();ready=not bool(self.maintenance_owner)
+            except APIError:ready=False
+            result=dict(ready=ready,checkpoint=self._copy(self.active_checkpoint),last_success=self._copy(self.ledger['last_success']),last_error=self._copy(self.ledger['last_error']),rollback=None,updated_ms=self.clock())
+        if self.rollback:result['rollback']=self.rollback.current()
+        return result
+    def list_snapshots(self):
+        with self.lock:
+            metadata={record.get('snapshot'):record.get('event','unknown') for collection in ('operations','lifecycle','recovery') for record in self.ledger[collection].values()}
+            return dict(snapshots=[dict(name=name,guid=guid,event=metadata.get(name,'unknown')) for name,guid in self.backend.snapshots() if OWNED.fullmatch(name)],updated_ms=self.clock())
 
+Coordinator=CheckpointService

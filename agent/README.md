@@ -1,61 +1,61 @@
-# Local snapshot host agent
+# HTTP snapshot and rollback companion
 
-Run the agent as a Docker container alongside the server-side mod. It manages local snapshots; configure Storage replication independently in native TrueNAS. The source must already be the dedicated ZFS dataset mounted at the configured world path, with `level.dat` present.
+The server-side Mod sends authenticated HTTP requests to this Docker companion. The Mod owns save barriers and scheduling; the companion owns local ZFS snapshots and optional Crafty rollback. Native TrueNAS replication independently copies published `mc-hourly-*` snapshots. There are no shared mailbox files, heartbeat polling, host scheduler jobs, Docker sockets or host PID namespaces.
 
-Build the image from the repository root:
+Build from the repository root:
 
 ```sh
 docker build -t minecraft-zfs-agent:local .
 ```
 
-The image uses Debian trixie, Python 3.13, Linux `findmnt`, and ZFS 2.3 userspace from [Debian's `contrib` repository](https://packages.debian.org/trixie/zfsutils-linux). It uses the host's existing ZFS kernel module and does not install a kernel module. Builds reject an unexpected ZFS userspace major/minor. If Docker's build network cannot resolve Debian mirrors on your host, build with `docker build --network=host -t minecraft-zfs-agent:local .`; the running service still has networking disabled.
+If Docker's build network cannot resolve Debian mirrors, use `--network=host` for the build. The image includes Python 3.13, `findmnt`, and ZFS 2.3 userspace from [Debian trixie contrib](https://packages.debian.org/trixie/zfsutils-linux). It uses the host's existing ZFS kernel module. Version 2.3.9 userspace was validated against TrueNAS kernel module 2.3.0; repeat disposable validation after upgrades.
 
-Use [deploy/compose.example.yaml](../deploy/compose.example.yaml). Set `AGENT_CONFIG` to the absolute path of your root-owned JSON configuration; set `WORLD_PATH`, `MAILBOX_PATH`, and `STATE_DIR` to the exact absolute host paths also used in that JSON. Pre-create the mailbox for the game UID and the private root-owned state directory. Then run from the repository root:
+Copy [deploy/.env.example](../deploy/.env.example), choose the fixed host paths, and prepare a private configuration from [deploy/agent.example.json](../deploy/agent.example.json). For rollback use [deploy/agent.crafty.example.json](../deploy/agent.crafty.example.json). Configuration and secrets must be root-owned mode0600; the secrets and HTTP state directories must be root-owned mode0700. Generate an API token with at least32 characters, and install the same token in the Mod's configured token file with permissions allowing the game UID to read its own copy. Keep the API and Crafty tokens outside the world directory. Use a new HTTP state directory when upgrading from the old mailbox agent, preserving its ledger separately.
 
-```sh
-docker compose -f deploy/compose.example.yaml up -d --no-build
-docker compose -f deploy/compose.example.yaml logs --tail=50 agent
-docker compose -f deploy/compose.example.yaml exec agent python3 -m minecraft_zfs_agent --config /etc/minecraft-zfs-agent.json status
-```
-
-The Compose example mounts the world read-only at its exact host absolute path so strict dataset/mount verification also works in the container namespace. It mounts the mailbox and state read/write at their configured absolute paths, and configuration read-only at `/etc/minecraft-zfs-agent.json`. Missing bind sources are rejected instead of being created as directories. It exposes `/dev/zfs`, drops default capabilities, and adds `SYS_ADMIN` for ZFS ioctls plus `DAC_OVERRIDE` to write the game-owned private mailbox. The container has a read-only root filesystem, no network, and no Docker socket, host PID namespace or privileged mode. These permissions still allow host ZFS administration through `/dev/zfs`; only trusted administrators should control the image and configuration. The heartbeat health check reports whether the exact source is ready.
-
-For development, the Python 3.11+ package can also run directly from the checkout:
+Connect the companion and Crafty to the same existing private Docker network. Set `AGENT_NETWORK` to its name. The Compose service has the DNS alias `minecraft-zfs-agent`; the Mod defaults to `http://minecraft-zfs-agent:8765`. No host port is published.
 
 ```sh
-PYTHONPATH=/absolute/repository/agent python3 -m minecraft_zfs_agent --config /absolute/config.json run
-PYTHONPATH=/absolute/repository/agent python3 -m minecraft_zfs_agent --config /absolute/config.json status
+docker compose --env-file deploy/.env -f deploy/compose.example.yaml up -d --build
+docker compose --env-file deploy/.env -f deploy/compose.example.yaml logs --tail=50 agent
 ```
 
-Administrator JSON configuration fields:
+The world bind must use the exact same absolute host path inside the container, so the companion can verify the actual source dataset and mount. It is writable for rollback; set `WORLD_READ_ONLY=true` for snapshot-only operation without Crafty. State is a separate writable private bind, while configuration and the secrets directory are read-only. Missing bind sources are rejected. The root filesystem is read-only, default capabilities are dropped, and only `SYS_ADMIN`, `DAC_OVERRIDE`, `CHOWN`, `FOWNER`, and `FSETID` are added. ZFS ioctls require `SYS_ADMIN`; restoration needs ownership, timestamps, modes and setgid metadata preserved. These capabilities were checked in disposable containers; the service uses no privileged mode. Access to `/dev/zfs` still grants substantial host ZFS authority, so the image and fixed administrator configuration must remain trusted.
+
+## Configuration
 
 | Field | Meaning | Default |
 | --- | --- | --- |
-| `source_dataset` | Dedicated existing world dataset | required |
-| `world_path` | Exact absolute source mount path on the host | required |
-| `mailbox_path` | Pre-created shared host directory corresponding to the mod mailbox | required |
-| `state_dir` | Private host ledger/status directory outside the mailbox | required |
+| `source_dataset` | Existing dedicated world dataset | required |
+| `world_path` | Exact absolute world mount | required |
+| `state_dir` | Private durable HTTP operation state, outside world | required |
+| `api_token_file` | Private API token file outside world | required |
+| `listen_host` | Private container listen interface | `0.0.0.0` |
+| `listen_port` | HTTP port | `8765` |
 | `keep` | Newest managed published local snapshots retained | `24` |
-| `poll_seconds` | Request polling interval, greater than zero and at most one second | `0.2` |
-| `min_interval_seconds` | Minimum interval between accepted checkpoints | `60` |
+| `min_interval_seconds` | Minimum normal checkpoint acceptance interval | `60` |
+| `crafty` | Optional fixed Crafty integration | absent |
 
-No target dataset is required. The configuration file must be root-owned and not writable by group or others. The state directory must be root-owned with mode `0700`; the daemon creates it if absent. Create the mailbox so the game UID can write it before starting Compose. Root writes shared responses and heartbeat with mode `0644`, including under a private service umask. Persistent ledger and retention status use mode `0600`. The production interval policy is at least 60 seconds; lower values are intended for isolated validation only. The agent never creates or changes the source dataset or its mount properties.
+Crafty configuration includes `base_url`, `server_id`, `token_file`, `verify_tls` (defaulttrue), optional `ca_file`, and stop/start timeouts (default180 seconds). Use a dedicated restricted account and key for the selected server. Trust its private CA and use a Docker DNS alias that exactly matches a valid certificate SAN. Rollback requires a writable world bind and verified Crafty server control. Without Crafty, the checkpoint API remains available and rollback endpoints report that integration is disabled.
 
-`heartbeat.json` refreshes every half second independently of snapshot commands. Its readiness requires fresh successful source preflight. Requests are strict v1 objects, limited to 16 KiB, with canonical UUIDs, integer timestamps, an at most 60-second freeze window, and exact phase-specific fields. The host never uses mailbox messages for commands, datasets, or filesystem paths.
+## API and persistence
 
-The durable ledger records intent before creating an unpublished `pending-mc-hourly-*` snapshot. Snapshot completion must pass a second check of the same still-current FROZEN request. A matching COMMIT is accepted only for its original timestamp window and recorded GUID, within 60 seconds after its original deadline. A durable publish intent makes a crash around the ZFS rename recoverable. Repeated COMMIT requests are idempotent. Cancellation and superseding FROZEN requests remove the recorded pending snapshot; acknowledged pending snapshots are retained through the 60-second COMMIT receive grace before timeout cleanup. Startup removes strictly named orphan pending snapshots. A changed pending GUID requires administrator investigation and is never destroyed automatically.
+See the frozen [HTTP API contract](../docs/http-api.md). Every `/v1/` request requires constant-time Bearer authentication. The unauthenticated `/healthz` reveals only readiness. Requests have a 16KiB body limit, bounded socket reads, and at most eight concurrent workers. Authorization headers and tokens are never logged. The Mod checks readiness by preparing a checkpoint, rather than periodically polling it.
 
-COMMITTED acknowledges the local rename. Local retention runs after completion, including if response publication temporarily fails. The host retains the newest `keep` managed published snapshots and preserves foreign snapshots. It checks external ZFS holds before destruction and skips snapshots that become held or busy during destruction. Retention uses individual non-forced, non-recursive `zfs destroy` calls. Held replication bases can therefore extend retention beyond the configured count; independent replication tasks control their own hold and destination retention policies. TrueNAS hold-pending is retention bookkeeping and does not replace real ZFS holds when this agent prunes snapshots. Replication tasks should select published `mc-hourly-*` snapshots and exclude `pending-*` snapshots.
+Checkpoints prepare before disabling saving, snapshot only after the Mod's flush barrier, and publish only after the Mod restores flags and commits. Pending snapshots remain invisible to managed listing and native replication. A durable root-owned intent precedes each snapshot; recorded GUIDs fence publication and cleanup. Commit timing must match the original window, with at most one second future skew and at most60 seconds receipt grace. Deadline timers clean abandoned checkpoints without file polling. Idempotent retries cannot create another published snapshot. Restart reconciles a persisted rename intent and removes strictly named orphan pending points. History is bounded while active/held recovery dependencies remain available.
 
-`status` prints the heartbeat, lifecycle ledger, retention result, and whether the heartbeat is currently fresh and ready. Status files are `state_dir/ledger.json` and `state_dir/retention.json`. Standard logging goes to stderr for Docker logs. An exclusive `flock` prevents duplicate host agents.
+Lifecycle events preserve startup/shutdown metadata. Shutdown backups additionally acquire a shared POSIX record lock on the actual existing `session.lock` through a read-only descriptor. A running JVM's exclusive lock prevents the snapshot, including when an old shutdown event arrives late. The lock inode is checked before publication. During rollback maintenance, lifecycle requests are recorded and skipped without cancelling or committing another operation.
 
-Run isolated tests without ZFS or Minecraft (Docker Compose is needed for packaging-contract checks):
+`GET /v1/status` reports checkpoint, last success/error and current/last rollback. `GET /v1/snapshots` lists published names, GUIDs and known event metadata. Old snapshots can have event `unknown`. Private `ledger.json`, `retention.json` and `rollback.json` remain in the state directory; logs go to Docker stderr. An exclusive process lock prevents two companions sharing the same state.
+
+Rollback runs as a durable background job. It holds the selected point, disables Crafty automatic restart policy, confirms fresh stopped statistics and obtains the real exclusive session lock. It records a held pre-recovery snapshot, restores by bounded block-cloning copies into the existing world dataset, validates the result, and records a completion point before restarting. It preserves `session.lock`, existing dataset identity, newer snapshots, metadata and symlinks. It uses no recursive ZFS rollback, forced receive or live mount switch. Interrupted jobs resume from durable phases; failed jobs retain maintenance and recovery points for explicit administrative investigation. Read job status before taking further action.
+
+Local retention deletes only old owned published snapshots through individual non-forced, non-recursive destruction. It preserves foreign names and real external holds, skipping busy/held races. TrueNAS's hold-pending setting is retention bookkeeping and does not create kernel holds against an external pruner; configure native replication and outage monitoring accordingly.
+
+## Validation
 
 ```sh
 cd agent
 python3 -m unittest discover -s tests -v
 ```
 
-Tests use temporary mailboxes and injectable in-memory ZFS backends. Real ZFS and Minecraft save-barrier validation belong in a disposable integration environment.
-
-Docker validation on the inspected TrueNAS host used ZFS userspace 2.3.9 against kernel module 2.3.0. Exact-path read-only bind preflight passed with `SYS_ADMIN`; writing a game-owned mode0700 mailbox additionally required `DAC_OVERRIDE`. Repeat disposable-dataset validation when changing host ZFS or container userspace versions. The mod schedules checkpoints; Docker keeps the agent running. No host scheduler is needed for local snapshots.
+Most tests use temporary state and injectable ZFS/Crafty backends. Docker packaging checks need Compose; Java lock compatibility and actual disposable ZFS checks run when their prerequisites are available. Production rollback is never a test target. The standalone Python CLI remains available for development and reading local durable status; Docker is the deployment path.

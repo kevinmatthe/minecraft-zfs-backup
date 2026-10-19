@@ -52,7 +52,7 @@ class ZFS:
         return result
 
     def snapshot(self, name):
-        if not PENDING.fullmatch(name): raise ValueError('invalid pending snapshot name')
+        if not (PENDING.fullmatch(name) or OWNED.fullmatch(name)): raise ValueError('invalid managed snapshot name')
         self.run('snapshot',self.config.source_dataset+'@'+name,timeout=10)
 
     def rename(self, old, new):
@@ -88,3 +88,35 @@ class ZFS:
             result['deleted'].append(name)
             logging.info('pruned owned local snapshot %s',full)
         return result
+
+    def list_snapshots(self):return dict(self.snapshots())
+
+    def guid(self,name):
+        if not (OWNED.fullmatch(name) or PENDING.fullmatch(name)):raise ValueError('invalid managed snapshot name')
+        value=dict(self.snapshots()).get(name)
+        if value is None:
+            from .protocol import APIError
+            raise APIError(409,'snapshot_missing','Recorded snapshot is missing')
+        return value
+
+    def snapshot_path(self,name):
+        if not OWNED.fullmatch(name):raise ValueError('invalid published snapshot')
+        return self.config.world_path/'.zfs'/'snapshot'/name
+
+    def hold(self,name,tag):
+        self.guid(name)
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}',tag):raise ValueError('invalid hold tag')
+        full=self.config.source_dataset+'@'+name
+        tags={line.split('\t')[1] for line in self.run('holds','-H',full).splitlines()}
+        if tag not in tags:self.run('hold',tag,full)
+
+    def release(self,name,tag):
+        self.guid(name)
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}',tag):raise ValueError('invalid hold tag')
+        full=self.config.source_dataset+'@'+name
+        tags={line.split('\t')[1] for line in self.run('holds','-H',full).splitlines()}
+        if tag in tags:self.run('release',tag,full)
+
+    def holds(self,name):
+        self.guid(name)
+        return {line.split('\t')[1] for line in self.run('holds','-H',self.config.source_dataset+'@'+name).splitlines()}

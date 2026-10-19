@@ -14,5 +14,7 @@ RUN sed -i 's/^Components: main$/Components: main contrib/' /etc/apt/sources.lis
 WORKDIR /opt/minecraft-zfs-agent
 COPY agent/minecraft_zfs_agent/ /opt/minecraft-zfs-agent/minecraft_zfs_agent/
 
+EXPOSE 8765
+
 ENTRYPOINT ["/usr/bin/python3", "-m", "minecraft_zfs_agent"]
 CMD ["--config", "/etc/minecraft-zfs-agent.json", "run"]

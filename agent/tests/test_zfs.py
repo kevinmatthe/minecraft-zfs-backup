@@ -25,7 +25,7 @@ class MemoryZFS(ZFS):
 
 class RetentionTests(unittest.TestCase):
     def setUp(self):
-        self.config=Config('tank/world',Path('/world'),Path('/mail'),Path('/state'),keep=2)
+        self.config=Config('tank/world',Path('/world'),Path('/state'),Path('/token'),keep=2)
         self.z=MemoryZFS(self.config)
     def test_prune_only_old_owned_published_snapshots(self):
         self.z.data.update({name(n):str(n) for n in range(1,5)})
@@ -49,7 +49,7 @@ class RetentionTests(unittest.TestCase):
         self.assertNotIn(name(2),self.z.data)
         self.assertEqual(result['held'],[name(1)])
     def test_default_keep_is_24(self):
-        self.z=MemoryZFS(Config('tank/world',Path('/world'),Path('/mail'),Path('/state')))
+        self.z=MemoryZFS(Config('tank/world',Path('/world'),Path('/state'),Path('/token')))
         self.z.data.update({name(n):str(n) for n in range(1,30)})
         self.z.prune()
         self.assertEqual(len(self.z.data),24)
@@ -63,8 +63,8 @@ class RetentionTests(unittest.TestCase):
 class BackendPreflightTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory()
-        root=Path(self.tmp.name);(root/'level.dat').touch()
-        self.config=Config('tank/world',root,root/'mail',root/'state')
+        root=Path(self.tmp.name);(root/'world').mkdir();(root/'world/level.dat').touch()
+        self.config=Config('tank/world',root/'world',root/'state',root/'token')
         self.z=ZFS(self.config)
     def tearDown(self):self.tmp.cleanup()
     def test_preflight_checks_exact_mount_and_world_marker(self):

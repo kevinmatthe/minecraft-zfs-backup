@@ -1,76 +1,42 @@
-import json
-import os
 from pathlib import Path
 import tempfile
-import threading
-import time
 import unittest
-from unittest.mock import patch
-
-from minecraft_zfs_agent.config import Config
-from minecraft_zfs_agent.protocol import atomic_json, read_json
-from minecraft_zfs_agent.daemon import InstanceLock, Heartbeat
+from minecraft_zfs_agent.config import Config,secret
+from minecraft_zfs_agent.daemon import InstanceLock
+from minecraft_zfs_agent.protocol import atomic_json,read_json,parse_json,APIError
 
 
-class WorkerTests(unittest.TestCase):
-    def test_single_instance_flock(self):
+class ConfigTests(unittest.TestCase):
+    def test_http_config_has_no_mailbox_or_polling(self):
+        config=Config('tank/world',Path('/world'),Path('/state'),Path('/token'))
+        self.assertEqual(config.listen_port,8765);self.assertFalse(hasattr(config,'mailbox_path'));self.assertFalse(hasattr(config,'poll_seconds'))
+    def test_private_root_configuration_and_strict_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'config.json';value=dict(source_dataset='tank/world',world_path='/world',state_dir='/state',api_token_file='/token')
+            atomic_json(path,value,mode=0o600);self.assertEqual(Config.load(path).keep,24)
+            atomic_json(path,value|dict(mailbox_path='/old'),mode=0o600)
+            with self.assertRaises(ValueError):Config.load(path)
+            atomic_json(path,value,mode=0o644)
+            with self.assertRaises(ValueError):Config.load(path)
+    def test_secret_is_private_regular_and_at_least32_chars(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'token';path.write_text('a'*32);path.chmod(0o600);self.assertEqual(secret(path),'a'*32)
+            path.write_text('short')
+            with self.assertRaises(ValueError):secret(path)
+            path.unlink();path.symlink_to('/etc/passwd')
+            with self.assertRaises(ValueError):secret(path)
+    def test_state_and_secrets_cannot_be_restored_world_entries(self):
+        for state,token in [('/world/state','/token'),('/state','/world/token')]:
+            with self.assertRaises(ValueError):Config('tank/world',Path('/world'),Path(state),Path(token))
+    def test_flock_prevents_duplicate_companions(self):
         with tempfile.TemporaryDirectory() as tmp:
             with InstanceLock(Path(tmp)):
                 with self.assertRaises(RuntimeError):
                     with InstanceLock(Path(tmp)):pass
-            with InstanceLock(Path(tmp)):pass
-    def test_atomic_shared_messages_are_readable_under_private_umask(self):
+    def test_file_and_http_json_fail_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
-            old=os.umask(0o077)
-            try:atomic_json(Path(tmp)/'response.json',{'ok':True})
-            finally:os.umask(old)
-            self.assertEqual((Path(tmp)/'response.json').stat().st_mode&0o777,0o644)
-    def test_heartbeat_keeps_refreshing_during_slow_preflight(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            stop=threading.Event()
-            class Backend:
-                def preflight(self):stop.wait(2)
-            heartbeat=Heartbeat(Backend(),Path(tmp),stop,interval=.02)
-            heartbeat.start();time.sleep(.07)
-            first=read_json(Path(tmp)/'heartbeat.json')
-            time.sleep(.05)
-            second=read_json(Path(tmp)/'heartbeat.json')
-            stop.set();heartbeat.join(2)
-            self.assertFalse(first['ready']);self.assertGreater(second['updated_ms'],first['updated_ms'])
-
-if __name__=='__main__':unittest.main()
-
-class ConfigurationTests(unittest.TestCase):
-    def test_rejects_untrusted_configuration_file_permissions(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path=Path(tmp)/'config.json'
-            atomic_json(path,dict(source_dataset='tank/world',world_path='/world',mailbox_path='/mail',state_dir='/state'),mode=0o666)
-            with self.assertRaises(ValueError):Config.load(path)
-    def test_rejects_config_that_places_state_inside_game_mailbox(self):
-        with self.assertRaises(ValueError):Config('tank/world',Path('/world'),Path('/mail'),Path('/mail/state'))
-    def test_rejects_command_like_dataset_names(self):
-        with self.assertRaises(ValueError):Config('tank/world;cmd',Path('/world'),Path('/mail'),Path('/state'))
-    def test_no_target_dataset_is_required(self):
-        config=Config('tank/world',Path('/world'),Path('/mail'),Path('/state'))
-        self.assertEqual(config.keep,24)
-        self.assertFalse(hasattr(config,'target_dataset'))
-    def test_unknown_config_fields_fail_with_clear_value_error(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path=Path(tmp)/'config.json'
-            atomic_json(path,dict(source_dataset='tank/world',world_path='/world',mailbox_path='/mail',state_dir='/state',command='bad'),mode=0o600)
-            with self.assertRaises(ValueError):Config.load(path)
-
-class CLITests(unittest.TestCase):
-    def test_status_accepts_local_config_without_target(self):
-        import subprocess
-        import sys
-        with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp)
-            config=root/'config.json'
-            atomic_json(config,dict(source_dataset='tank/world',world_path=str(root/'world'),mailbox_path=str(root/'mail'),state_dir=str(root/'state')),mode=0o600)
-            result=subprocess.run([sys.executable,'-m','minecraft_zfs_agent','--config',str(config),'status'],capture_output=True,text=True)
-            self.assertEqual(result.returncode,0,result.stderr)
-            value=json.loads(result.stdout)
-            self.assertFalse(value['ready'])
-            self.assertIn('retention',value)
-            self.assertNotIn('replication',value)
+            path=Path(tmp)/'json'
+            for raw in [b' '*16385,b'{"x":1,"x":2}',b'[]',b'\xff']:
+                path.write_bytes(raw)
+                with self.assertRaises(ValueError):read_json(path)
+                with self.assertRaises(APIError):parse_json(raw)

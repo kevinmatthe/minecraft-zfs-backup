@@ -1,274 +1,160 @@
-import json
-import os
-from pathlib import Path
 import tempfile
+from pathlib import Path
 import unittest
 import uuid
-
 from minecraft_zfs_agent.config import Config
-from minecraft_zfs_agent.protocol import validate_request, read_json, atomic_json
-from minecraft_zfs_agent.coordinator import Coordinator
+from minecraft_zfs_agent.coordinator import CheckpointService
+from minecraft_zfs_agent.protocol import APIError, read_json
 
 
 class FakeZFS:
     def __init__(self):
-        self.items = {}
-        self.events = []
-        self.after_snapshot = lambda: None
-        self.ready = True
-    def prune(self):
-        self.events.append(('prune',))
-        return {'deleted':[], 'held':[]}
+        self.items={};self.tags={};self.events=[];self.after_snapshot=lambda:None;self.ready=True
     def preflight(self):
-        if not self.ready:
-            raise RuntimeError('wrong source mount')
-    def snapshots(self, dataset, missing_ok=False):
-        return list(self.items.get(dataset, {}).items())
-    def snapshot(self, name):
-        self.events.append(('snapshot', name))
-        self.items.setdefault('tank/world', {})[name] = '123'
-        self.after_snapshot()
-    def rename(self, old, new):
-        self.events.append(('rename', old, new))
-        self.items['tank/world'][new] = self.items['tank/world'].pop(old)
-    def destroy_pending(self, name):
-        self.events.append(('destroy', name))
-        self.items.setdefault('tank/world', {}).pop(name, None)
+        if not self.ready:raise RuntimeError('wrong mount')
+    def snapshots(self,dataset=None):return list(self.items.items())
+    def snapshot(self,name):
+        self.events.append(('snapshot',name));self.items[name]='guid-'+str(len(self.events));self.after_snapshot()
+    def rename(self,old,new):self.events.append(('rename',old,new));self.items[new]=self.items.pop(old)
+    def destroy_pending(self,name):self.events.append(('destroy',name));self.items.pop(name,None)
+    def guid(self,name):return self.items[name]
+    def hold(self,name,tag):self.tags.setdefault(name,set()).add(tag)
+    def release(self,name,tag):self.tags.setdefault(name,set()).discard(tag)
+    def prune(self):self.events.append(('prune',));return {'deleted':[],'held':[]}
 
 
-class ProtocolTests(unittest.TestCase):
+class Fixture(unittest.TestCase):
     def setUp(self):
-        self.now = 1800000000000
-        self.msg = dict(protocol=1, id=str(uuid.uuid4()), phase='FROZEN',
-                        created_ms=self.now, deadline_ms=self.now + 15000)
-    def test_valid(self):
-        self.assertEqual(validate_request(self.msg, self.now), self.msg)
-    def test_strict_invalid_messages(self):
-        mutations = [{'protocol': True}, {'protocol': 2}, {'created_ms': 1.2},
-                     {'id': self.msg['id'].upper()}, {'id': 'bad'}, {'phase':'OTHER'},
-                     {'deadline_ms': self.now}, {'created_ms': self.now + 1001},
-                     {'deadline_ms': self.now + 60001}, {'path': '/evil'},
-                     {'created_ms': True}, {'committed_ms':self.now}]
-        for mutation in mutations:
-            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
-                validate_request(self.msg | mutation, self.now)
-    def test_expired_frozen_and_forged_commit(self):
-        for msg, now in [(self.msg, self.now+15000),
-                         (self.msg | dict(phase='COMMIT', committed_ms=self.now-1), self.now),
-                         (self.msg | dict(phase='COMMIT', committed_ms=self.now+1001), self.now),
-                         (self.msg | dict(phase='COMMIT', committed_ms=self.now+15001), self.now+15001),
-                         (self.msg | dict(phase='COMMIT', committed_ms=self.now), self.now+75001)]:
-            with self.subTest(msg=msg, now=now), self.assertRaises(ValueError):
-                validate_request(msg, now)
-    def test_file_bounds_duplicates_and_symlinks(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp)/'message.json'
-            for raw in [b' ' * 16385, b'{"protocol":1,"protocol":1}', b'[]', b'\xff']:
-                path.write_bytes(raw)
-                with self.assertRaises(ValueError): read_json(path)
-            path.unlink(); path.symlink_to('/etc/passwd')
-            with self.assertRaises((ValueError, OSError)): read_json(path)
+        self.tmp=tempfile.TemporaryDirectory();root=Path(self.tmp.name)
+        self.config=Config('tank/world',root/'world',root/'state',root/'token',min_interval_seconds=0)
+        self.config.world_path.mkdir();(self.config.world_path/'session.lock').write_bytes(b'lock')
+        self.now=1800000000000;self.zfs=FakeZFS();self.service=CheckpointService(self.config,self.zfs,lambda:self.now)
+        self.body=dict(id=str(uuid.uuid4()),event='manual_save',created_ms=self.now,deadline_ms=self.now+15000)
+    def tearDown(self):self.service.close();self.tmp.cleanup()
+    def prepare(self):return self.service.prepare(self.body)
+    def freeze(self):self.prepare();return self.service.snapshot(self.body['id'],{'frozen_ms':self.now})
+    def commit(self):return self.service.commit(self.body['id'],{'committed_ms':self.now})
 
 
-class CoordinatorFixture(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        root = Path(self.tmp.name)
-        self.config = Config('tank/world', root/'world', root/'mailbox', root/'state', min_interval_seconds=0)
-        self.config.mailbox_path.mkdir()
-        self.now = 1800000000000
-        self.backend = FakeZFS()
-        self.agent = Coordinator(self.config, self.backend, lambda: self.now)
-        self.msg = dict(protocol=1, id=str(uuid.uuid4()), phase='FROZEN', created_ms=self.now, deadline_ms=self.now+15000)
-    def tearDown(self): self.tmp.cleanup()
-    def request(self, msg=None): atomic_json(self.config.mailbox_path/'request.json', msg or self.msg)
-    def response(self): return read_json(self.config.mailbox_path/'response.json')
-    def tick(self): self.agent.tick()
-    def freeze(self): self.request(); self.tick(); return self.response()['snapshot']
-    def commit(self): self.request(self.msg | dict(phase='COMMIT', committed_ms=self.now)); self.tick()
-
-
-class CoordinatorTests(CoordinatorFixture):
-    def test_only_matching_commit_publishes(self):
-        name = self.freeze()
-        self.assertEqual(self.response()['phase'], 'SNAPSHOT_READY')
-        self.assertIn('pending-'+name, self.backend.items['tank/world'])
-        self.request(self.msg | dict(id=str(uuid.uuid4()), phase='COMMIT', committed_ms=self.now)); self.tick()
-        self.assertNotIn(name, self.backend.items['tank/world'])
-        self.commit()
-        self.assertEqual(self.response()['phase'], 'COMMITTED')
-    def test_intent_is_durable_before_snapshot(self):
-        self.backend.after_snapshot = lambda: self.assertIsNotNone(read_json(self.config.state_dir/'ledger.json')['pending'])
+class CheckpointTests(Fixture):
+    def test_prepare_does_not_snapshot(self):
+        self.assertEqual(self.prepare()['state'],'PREPARED');self.assertEqual(self.zfs.items,{})
+    def test_only_commit_publishes_matching_recorded_snapshot(self):
+        ready=self.freeze();name=ready['snapshot'];guid=self.zfs.items['pending-'+name]
+        self.assertEqual(ready['state'],'SNAPSHOT_READY');self.assertNotIn(name,self.zfs.items)
+        result=self.commit();self.assertEqual(result['state'],'COMMITTED');self.assertEqual(self.zfs.items[name],guid)
+    def test_intent_exists_before_snapshot(self):
+        def check():
+            ledger=read_json(self.config.state_dir/'ledger.json')
+            self.assertEqual(ledger['operations'][self.body['id']]['state'],'SNAPSHOTTING')
+        self.zfs.after_snapshot=check;self.freeze()
+    def test_snapshot_completed_after_deadline_cannot_publish(self):
+        self.zfs.after_snapshot=lambda:setattr(self,'now',self.now+15001)
+        with self.assertRaises(APIError) as error:self.freeze()
+        self.assertEqual(error.exception.status,410);self.assertEqual(self.zfs.items,{})
+    def test_other_id_cannot_commit_or_cancel_pending(self):
+        ready=self.freeze();other=str(uuid.uuid4())
+        for method,key in [(self.service.commit,'committed_ms'),(self.service.cancel,'cancelled_ms')]:
+            with self.assertRaises(APIError):method(other,{key:self.now})
+        self.assertIn('pending-'+ready['snapshot'],self.zfs.items)
+    def test_invalid_modified_prepare_or_phase_identity_is_conflict(self):
         self.freeze()
-        self.assertEqual((self.config.state_dir/'ledger.json').stat().st_mode & 0o777, 0o600)
-    def test_snapshot_rechecks_current_request(self):
-        self.backend.after_snapshot = lambda: self.request(self.msg | dict(phase='CANCEL', cancelled_ms=self.now))
-        self.request(); self.tick()
-        self.assertFalse(self.backend.items['tank/world'])
-    def test_snapshot_that_finishes_after_deadline_is_destroyed(self):
-        self.backend.after_snapshot = lambda: setattr(self, 'now', self.now+15001)
-        self.request(); self.tick()
-        self.assertFalse(self.backend.items['tank/world'])
-    def test_cancel_timeout_and_superseding_cleanup(self):
-        for mode in ['cancel','timeout','supersede']:
-            with self.subTest(mode=mode):
-                self.msg['id'] = str(uuid.uuid4()); self.msg['created_ms']=self.now; self.msg['deadline_ms']=self.now+15000
-                name=self.freeze()
-                if mode=='cancel': self.request(self.msg | dict(phase='CANCEL', cancelled_ms=self.now))
-                elif mode=='timeout': self.now += 75001
-                else: self.request(self.msg | dict(id=str(uuid.uuid4()), created_ms=self.now+1000)); self.now += 1000
-                self.tick()
-                self.assertNotIn('pending-'+name, self.backend.items['tank/world'])
-    def test_duplicate_commit_and_restart_are_idempotent(self):
-        name=self.freeze(); self.commit(); self.commit()
-        agent=Coordinator(self.config,self.backend,lambda:self.now)
-        agent.tick()
-        self.assertEqual(len([e for e in self.backend.events if e[0]=='rename']),1)
-        self.assertEqual(self.response()['snapshot'],name)
-    def test_restart_completes_commit_from_pending(self):
-        name=self.freeze()
-        self.request(self.msg | dict(phase='COMMIT', committed_ms=self.now))
-        self.agent=Coordinator(self.config,self.backend,lambda:self.now)
-        self.tick()
-        self.assertIn(name,self.backend.items['tank/world'])
-    def test_changed_window_cannot_commit(self):
-        name=self.freeze()
-        self.request(self.msg | dict(phase='COMMIT', deadline_ms=self.now+20000, committed_ms=self.now))
-        self.tick()
-        self.assertNotIn(name,self.backend.items['tank/world'])
-    def test_guid_mismatch_prevents_publish(self):
-        name=self.freeze(); self.backend.items['tank/world']['pending-'+name]='forged'
-        with self.assertLogs(level='ERROR'): self.commit()
-        self.assertNotIn(name,self.backend.items['tank/world'])
-    def test_preflight_prevents_heartbeat_readiness_and_snapshot(self):
-        self.backend.ready=False; self.request()
-        with self.assertLogs(level='ERROR'): self.tick()
-        self.assertFalse(read_json(self.config.mailbox_path/'heartbeat.json')['ready'])
-        self.assertEqual(self.backend.events,[])
-    def test_rate_limit_persists_after_restart(self):
-        config = Config(self.config.source_dataset,self.config.world_path,self.config.mailbox_path,self.config.state_dir)
-        self.agent=Coordinator(config,self.backend,lambda:self.now)
-        self.freeze(); self.commit()
-        self.now+=2000; self.msg.update(id=str(uuid.uuid4()),created_ms=self.now,deadline_ms=self.now+15000)
-        self.agent=Coordinator(config,self.backend,lambda:self.now)
-        self.request();self.tick()
-        self.assertEqual(len([e for e in self.backend.events if e[0]=='snapshot']),1)
+        with self.assertRaises(APIError):self.service.prepare(self.body|dict(event='periodic_save'))
+        with self.assertRaises(APIError):self.service.snapshot(self.body['id'],{'frozen_ms':self.now+1})
+    def test_commit_without_snapshot_fails(self):
+        self.prepare()
+        with self.assertRaises(APIError):self.commit()
+        self.assertEqual(self.zfs.items,{})
+    def test_late_received_timely_commit_survives_expiry_timer(self):
+        self.freeze();committed=self.now+14000;self.now+=16000;self.service.expire()
+        result=self.service.commit(self.body['id'],{'committed_ms':committed})
+        self.assertEqual(result['state'],'COMMITTED')
+    def test_commit_beyond_grace_or_future_or_forged_is_rejected(self):
+        self.freeze()
+        for value in [self.now-1,self.now+1001,self.now+15001,True]:
+            with self.assertRaises(APIError):self.service.commit(self.body['id'],{'committed_ms':value})
+        self.now+=75001
+        with self.assertRaises(APIError):self.service.commit(self.body['id'],{'committed_ms':self.body['created_ms']})
+        self.assertFalse(self.zfs.items)
+    def test_cancel_removes_only_pending_and_committed_never_deleted(self):
+        ready=self.freeze();self.service.cancel(self.body['id'],{'cancelled_ms':self.now})
+        self.assertFalse(self.zfs.items)
+        self.now+=2000;self.body.update(id=str(uuid.uuid4()),created_ms=self.now,deadline_ms=self.now+15000)
+        ready=self.freeze();self.commit();self.service.cancel(self.body['id'],{'cancelled_ms':self.now})
+        self.assertIn(ready['snapshot'],self.zfs.items)
+    def test_duplicate_commit_restart_and_crash_after_rename(self):
+        ready=self.freeze();original=self.zfs.rename
+        def crash(old,new):original(old,new);raise RuntimeError('simulated crash')
+        self.zfs.rename=crash
+        with self.assertRaises(RuntimeError):self.commit()
+        self.zfs.rename=original;self.service.close()
+        self.service=CheckpointService(self.config,self.zfs,lambda:self.now)
+        self.assertEqual(self.commit()['state'],'COMMITTED')
+        self.assertEqual(len([e for e in self.zfs.events if e[0]=='rename']),1)
+        self.assertIn(ready['snapshot'],self.zfs.items)
+    def test_replaced_guid_cannot_publish_or_destroy(self):
+        ready=self.freeze();self.zfs.items['pending-'+ready['snapshot']]='replaced'
+        with self.assertRaises(APIError):self.commit()
+        with self.assertRaises(APIError):self.service.cancel(self.body['id'],{'cancelled_ms':self.now})
+        self.assertIn('pending-'+ready['snapshot'],self.zfs.items)
+    def test_preflight_unavailable_or_concurrent_checkpoint_rejected(self):
+        self.zfs.ready=False
+        with self.assertRaises(APIError) as err:self.prepare()
+        self.assertEqual(err.exception.status,503)
+        self.zfs.ready=True;self.prepare()
+        with self.assertRaises(APIError) as err:self.service.prepare(self.body|dict(id=str(uuid.uuid4())))
+        self.assertEqual(err.exception.status,409)
+    def test_prepare_validation_strict_fields_integer_time_and_uuid(self):
+        for change in [{'event':'unknown'},{'path':'evil'},{'created_ms':True},{'id':'bad'},{'deadline_ms':self.now+60001},{'created_ms':self.now+1001}]:
+            with self.subTest(change=change),self.assertRaises(APIError):self.service.prepare(self.body|change)
+    def test_maintenance_gate_blocks_checkpoints_and_recovery_is_idempotent(self):
+        job=str(uuid.uuid4());self.service.enter_maintenance(job)
+        with self.assertRaises(APIError):self.prepare()
+        first=self.service.record_recovery('pre_rollback',job);second=self.service.record_recovery('pre_rollback',job)
+        self.assertEqual(first,second)
+        self.assertIn('minecraft-zfs-rollback-'+job,self.zfs.tags[first['snapshot']])
+        self.service.leave_maintenance(job);self.assertEqual(self.prepare()['state'],'PREPARED')
+    def test_active_checkpoint_blocks_maintenance(self):
+        self.prepare()
+        with self.assertRaises(APIError):self.service.enter_maintenance(str(uuid.uuid4()))
+    def test_lifecycle_dedup_shutdown_and_maintenance_skip(self):
+        event=dict(id=str(uuid.uuid4()),event='server_started',created_ms=self.now,backup_requested=False)
+        self.assertEqual(self.service.lifecycle(event)['state'],'RECORDED');self.assertFalse(self.zfs.items)
+        stop=event|dict(id=str(uuid.uuid4()),event='server_stopped',backup_requested=True)
+        result=self.service.lifecycle(stop);self.assertEqual(result['state'],'COMMITTED')
+        self.assertEqual(self.service.lifecycle(stop),result)
+        self.service.enter_maintenance(str(uuid.uuid4()));self.now+=2000
+        skipped=self.service.lifecycle(stop|dict(id=str(uuid.uuid4()),created_ms=self.now))
+        self.assertEqual(skipped['state'],'SKIPPED')
+    def test_status_and_list_include_event_and_exclude_pending(self):
+        ready=self.freeze();self.assertEqual(self.service.list_snapshots()['snapshots'],[])
+        self.commit();listed=self.service.list_snapshots()['snapshots']
+        self.assertEqual(listed[0]['name'],ready['snapshot']);self.assertEqual(listed[0]['event'],'manual_save')
+        self.assertTrue(self.service.status()['ready'])
 
-if __name__=='__main__': unittest.main()
+if __name__=='__main__':unittest.main()
 
-class RecoveryTests(CoordinatorFixture):
-    def test_crash_after_rename_before_completed_ledger_is_recovered(self):
-        name=self.freeze()
-        original=self.backend.rename
-        def renamed_then_crash(old,new):
-            original(old,new)
-            raise RuntimeError('simulated crash after rename')
-        self.backend.rename=renamed_then_crash
-        with self.assertLogs(level='ERROR'):self.commit()
-        self.assertIn(name,self.backend.items['tank/world'])
-        self.backend.rename=original
-        self.agent=Coordinator(self.config,self.backend,lambda:self.now)
-        self.tick()
-        self.assertEqual(self.response()['phase'],'COMMITTED')
-        self.assertIsNone(read_json(self.config.state_dir/'ledger.json')['pending'])
-    def test_restart_does_not_republish_foreign_guid_at_published_name(self):
-        name=self.freeze()
-        ledger=read_json(self.config.state_dir/'ledger.json')
-        ledger['pending']['publish_intent']=dict(committed_ms=self.now,received_ms=self.now)
-        atomic_json(self.config.state_dir/'ledger.json',ledger,mode=0o600)
-        self.backend.items['tank/world'][name]='foreign'
-        self.agent=Coordinator(self.config,self.backend,lambda:self.now)
-        with self.assertLogs(level='ERROR'):self.tick()
-        self.assertEqual(self.response()['phase'],'ERROR')
-        self.assertEqual(self.backend.items['tank/world'][name],'foreign')
-    def test_cancel_other_id_cannot_destroy_pending(self):
-        name=self.freeze()
-        self.request(self.msg|dict(id=str(uuid.uuid4()),phase='CANCEL',cancelled_ms=self.now))
-        self.tick()
-        self.assertIn('pending-'+name,self.backend.items['tank/world'])
-    def test_commit_without_ledger_cannot_publish_existing_pending(self):
-        name='pending-mc-hourly-20270115T080000Z'
-        self.backend.items['tank/world']={name:'123'}
-        self.commit()
-        self.assertEqual(self.response()['phase'],'ERROR')
-        self.assertEqual(self.backend.items['tank/world'],{})
-    def test_successive_local_snapshots_are_independent(self):
-        first=self.freeze();self.commit()
-        self.now+=2000;self.msg.update(id=str(uuid.uuid4()),created_ms=self.now,deadline_ms=self.now+15000)
-        second=self.freeze();self.commit()
-        self.assertNotEqual(first,second)
-        self.assertIn(first,self.backend.items['tank/world'])
-        self.assertIn(second,self.backend.items['tank/world'])
-    def test_timely_commit_received_after_deadline_can_publish(self):
-        name=self.freeze()
-        commit=self.msg|dict(phase='COMMIT',committed_ms=self.now+14000)
-        self.now+=20000;self.request(commit);self.tick()
-        self.assertIn(name,self.backend.items['tank/world'])
-    def test_commit_received_beyond_grace_cannot_publish(self):
-        name=self.freeze();commit=self.msg|dict(phase='COMMIT',committed_ms=self.now+14000)
-        self.now+=75001;self.request(commit);self.tick()
-        self.assertNotIn(name,self.backend.items['tank/world'])
-    def test_repeated_frozen_does_not_extend_or_duplicate_snapshot(self):
-        self.freeze();self.tick();self.tick()
-        self.assertEqual(len([e for e in self.backend.events if e[0]=='snapshot']),1)
-    def test_expired_duplicate_commit_does_not_repeat_publish(self):
-        self.freeze();self.commit();self.now+=75001;self.commit()
-        self.assertEqual(len([e for e in self.backend.events if e[0]=='rename']),1)
-    def test_same_id_different_window_cannot_relabel_pending_snapshot(self):
-        name=self.freeze();self.now+=1000
-        self.msg.update(created_ms=self.now,deadline_ms=self.now+15000)
-        self.request();self.tick()
-        self.assertIn('pending-'+name,self.backend.items['tank/world'])
-        self.assertEqual(len([e for e in self.backend.events if e[0]=='snapshot']),1)
+class ExtraSafetyTests(Fixture):
+    def test_same_process_commit_retry_recovers_publish_intent(self):
+        self.freeze();original=self.zfs.rename
+        def crash(old,new):original(old,new);raise RuntimeError('ambiguous rename')
+        self.zfs.rename=crash
+        with self.assertRaises(RuntimeError):self.commit()
+        self.zfs.rename=original
+        self.assertEqual(self.commit()['state'],'COMMITTED')
+    def test_shutdown_snapshot_skips_world_locked_by_another_process(self):
+        import subprocess,sys
+        child=subprocess.Popen([sys.executable,'-c',"import fcntl,sys,time; f=open(sys.argv[1],'r+b'); fcntl.lockf(f,fcntl.LOCK_EX); print('ready',flush=True); time.sleep(30)",str(self.config.world_path/'session.lock')],stdout=subprocess.PIPE,text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(),'ready')
+            result=self.service.lifecycle(dict(id=str(uuid.uuid4()),event='server_stopped',created_ms=self.now,backup_requested=True))
+            self.assertEqual(result['state'],'SKIPPED');self.assertFalse(self.zfs.items)
+        finally:child.terminate();child.wait();child.stdout.close()
 
-class AdditionalSafetyTests(CoordinatorFixture):
-    def test_restart_removes_orphaned_owned_pending_only(self):
-        self.backend.items['tank/world']={'pending-mc-hourly-20260101T000000Z':'1','pending-foreign':'2','manual':'3'}
-        self.tick()
-        self.assertEqual(self.backend.items['tank/world'],{'pending-foreign':'2','manual':'3'})
-    def test_replaced_pending_guid_is_not_destroyed_on_cancel(self):
-        name=self.freeze();self.backend.items['tank/world']['pending-'+name]='replaced'
-        self.request(self.msg|dict(phase='CANCEL',cancelled_ms=self.now))
-        with self.assertLogs(level='ERROR'):self.tick()
-        self.assertEqual(self.backend.items['tank/world']['pending-'+name],'replaced')
-
-class InterleavingTests(CoordinatorFixture):
-    def test_matching_commit_during_repeated_frozen_tick_is_preserved(self):
-        name=self.freeze()
-        original=self.backend.snapshots
-        calls=0
-        def interleaved(dataset,missing_ok=False):
-            nonlocal calls
-            calls+=1
-            if calls==1:self.request(self.msg|dict(phase='COMMIT',committed_ms=self.now))
-            return original(dataset,missing_ok)
-        self.backend.snapshots=interleaved
-        self.tick();self.tick()
-        self.assertIn(name,self.backend.items['tank/world'])
-        self.assertEqual(self.response()['phase'],'COMMITTED')
-    def test_acknowledged_snapshot_survives_deadline_tick_for_late_commit(self):
-        name=self.freeze()
-        committed=self.now+14000
-        self.now+=16000;self.tick()
-        self.request(self.msg|dict(phase='COMMIT',committed_ms=committed));self.tick()
-        self.assertIn(name,self.backend.items['tank/world'])
-    def test_unrelated_cancel_during_repeated_frozen_cannot_destroy_pending(self):
-        name=self.freeze();original=self.backend.snapshots
-        def interleaved(dataset,missing_ok=False):
-            self.request(self.msg|dict(id=str(uuid.uuid4()),phase='CANCEL',cancelled_ms=self.now))
-            return original(dataset,missing_ok)
-        self.backend.snapshots=interleaved
-        self.tick()
-        self.assertIn('pending-'+name,self.backend.items['tank/world'])
-
-class ResponseFailureTests(CoordinatorFixture):
-    def test_commit_response_failure_still_runs_local_retention(self):
-        from unittest.mock import patch
-        name=self.freeze()
-        original=self.agent.respond
-        def failed(*args,**kwargs):raise OSError('mailbox temporarily unavailable')
-        with patch.object(self.agent,'respond',side_effect=failed),self.assertLogs(level='ERROR'):
-            self.commit()
-        self.assertTrue(read_json(self.config.state_dir/'retention.json')['success'])
-        self.tick()
-        self.assertEqual(self.response()['phase'],'COMMITTED')
+class PrepareBudgetTests(Fixture):
+    def test_slow_preflight_does_not_prepare_after_freeze_deadline(self):
+        def slow():self.now+=15001
+        self.zfs.preflight=slow
+        with self.assertRaises(APIError) as error:self.prepare()
+        self.assertEqual(error.exception.status,410)
+        self.assertIsNone(self.service.active_checkpoint)

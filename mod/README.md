@@ -1,6 +1,6 @@
-# NeoForge save checkpoint bridge
+# NeoForge HTTP save checkpoint bridge
 
-Dedicated-server-only Java 21 mod for Minecraft 1.21.1 / NeoForge 21.1.251. It communicates with the host agent using [protocol v1](../docs/protocol.md); it has no ZFS, Docker, shell, or dataset-selection capabilities.
+Version 2.0.0 is a dedicated-server-only Java 21 mod for Minecraft 1.21.1 / NeoForge 21.1.251. It actively calls the companion's [HTTP API v1](../docs/http-api.md). Shared mailbox IPC from 1.x is removed. The mod never executes ZFS, Docker, shell commands, replication, or dataset selection.
 
 ## Build and test
 
@@ -11,42 +11,68 @@ cd mod
 ./gradlew build
 ```
 
-The standard build pins ModDevGradle 2.0.148, NeoForge 21.1.251 and Gradle 8.14.3. Wrapper distribution integrity is checked with SHA-256. Tests are executable pure Java programs, run by Gradle `check` as well as the portable builder. Gradle produces `build/libs/local-zfs-backup-1.21.1-1.0.0.jar`.
+The standard build pins ModDevGradle 2.0.148, NeoForge 21.1.251 and Gradle 8.14.3. The wrapper distribution has a pinned SHA-256. Gradle produces `build/libs/local-zfs-backup-1.21.1-2.0.0.jar`.
 
-To build without downloading Minecraft dependencies, point the portable builder at existing **matching** server libraries:
+The portable builder compiles and tests against existing matching server libraries, without downloading Minecraft dependencies:
 
 ```sh
 python3 build.py --libraries-dir /path/to/server/libraries --java /path/to/java21/bin/java
 ```
 
-Alternatively, compilation and tests can run in an existing container. Only a unique temporary build directory under `/tmp` is created and removed; server files are read, and the resulting artifact is copied to this checkout. Nothing is installed or restarted:
+Compilation can also run in an existing container. It reads server libraries and uses a unique temporary directory under `/tmp`; it does not install anything or restart services:
 
 ```sh
 python3 build.py --container minecraft-test --server-dir /path/to/server --java /path/to/java21/bin/java
 ```
 
-Python 3.11+ is required. This build uses `java -m jdk.compiler/com.sun.tools.javac.Main`, putting the mapped `*-srg.jar` before remaining server libraries. It produces `build/local-zfs-backup-1.21.1-1.0.0.jar`, containing production classes and mod metadata, excluding test classes. Both build paths run lifecycle, transport and dimension-saving tests. Linux builds additionally create real FIFO mailbox paths in temporary directories to verify nonblocking server ticks and timeout restoration.
+Python 3.11+ is required. The builder invokes the JDK compiler module, puts mapped `*-srg.jar` files before remaining dependencies, runs executable Java tests, and produces `build/local-zfs-backup-1.21.1-2.0.0.jar`. Tests are excluded from the artifact. The test suite covers lifecycle failure/timeouts/stale callbacks, activity generations, dimension saving flags, command rendering, and a real loopback HTTP server with malformed responses, authorization errors, redirects and stalled response bodies. Gradle `check` runs the same tests.
 
-## Configuration and commands
+## Configuration
 
-Copy `local-zfs-backup.properties.example` to the dedicated server's `config/local-zfs-backup.properties` before startup. Missing configuration uses defaults: interval 3600 seconds, maximum freeze 15 seconds, mailbox `.zfs-snapshot-bridge` relative to server root, and `only_if_players_been_online=true`. Restart to apply configuration. An invalid configuration disables the bridge and logs the reason.
+Copy `local-zfs-backup.properties.example` to the server's `config/local-zfs-backup.properties`. Restart to apply changes. Defaults:
 
-`interval_seconds` accepts 60..31536000; `freeze_timeout_seconds` accepts 1..15. `bridge_directory` must be relative and remain below server root. The host administrator must map the same mailbox directory into the host agent. Configure shared-directory permissions so the server and agent can read each other's files and publish atomic replacements.
+| Property | Default | Meaning |
+| --- | --- | --- |
+| `agent_url` | `http://minecraft-zfs-agent:8765` | Private HTTP(S) origin, without credentials, path, query or fragment |
+| `agent_token_file` | `config/local-zfs-backup.token` | Regular file containing the bearer token; relative to server root or an administrator-specified absolute path |
+| `interval_seconds` | `3600` | Elapsed real time between automatic checkpoints; 60..31536000 |
+| `freeze_timeout_seconds` | `15` | Total prepare/save/snapshot budget; 1..15 |
+| `only_if_players_been_online` | `true` | Skip automatic checkpoints without player activity since the last successful checkpoint |
+| `snapshot_on_shutdown` | `true` | Request an offline snapshot after orderly world closure, respecting activity |
 
-`/zfsbackup now` and `/zfsbackup status` require operator permission level 4. A manual request bypasses the ordinary interval, while respecting an existing request and the minimum 60-second failure/defer backoff. The host separately enforces its snapshot acceptance rate.
+Booleans accept exactly `true` or `false`. The token must contain at least 32 printable, non-space ASCII characters, with an optional trailing newline. Keep its file private and readable by the server UID. Tokens and authorization headers never enter logs or command output. Missing credentials or invalid configuration disables the bridge with a generic diagnostic. TLS uses the JVM's normal trust configuration. Redirects are disabled.
 
-With `only_if_players_been_online=true`, automatic checkpoints skip intervals with no player activity since the last successful checkpoint. Login and ticks with online players mark activity; pending activity remains after the last player leaves. Only a matching `COMMITTED` acknowledgement clears the generation captured when a checkpoint began. Failed checkpoints preserve it, and player activity during a checkpoint remains pending for the next backup. An empty freshly started server therefore skips automatic checkpoints; `/zfsbackup now` works regardless of activity. Set `only_if_players_been_online=false` to back up idle servers automatically. The setting accepts exactly `true` or `false`. Skipped automatic checkpoints schedule the next interval, and activity tracking starts fresh on server startup. The first automatic request occurs after a full interval; restarting the server starts a new interval.
+There is no heartbeat polling or file IPC. Agent readiness is checked by preparing each checkpoint. Changing world/dataset/Crafty-server selection is a host administrator operation; no chat command can change it.
 
-## Save lifecycle and limits
+## Operator commands
 
-The scheduler uses elapsed real time (`System.nanoTime`), so low TPS does not stretch the interval, and clock rollback cannot extend a freeze. Epoch milliseconds are used for heartbeat checks and protocol timestamps. A ready host heartbeat must be at most 5 seconds old and at most 1 second in the future before freezing.
+All commands require operator permission level 4:
 
-On the server thread the mod captures every dimension's `noSave` value, sets all to true, then calls `saveEverything(false, true, true)` for a forced flush. It optionally invokes `local.asyncplayersave.AsyncPlayerSave.backupCheckpoint(MinecraftServer)` by reflection; the returned completion stage schedules its completion onto the server thread. The game thread never waits on that stage using `join` or `get`. The deadline includes forced flush and asynchronous barriers. Pending stages and host messages are checked on server ticks.
+| Command | Behavior |
+| --- | --- |
+| `/zfsbackup save` | Force a save checkpoint, bypassing the idle filter |
+| `/zfsbackup now` | Alias for `save` |
+| `/zfsbackup status` | Local checkpoint/activity status and active HTTP agent status |
+| `/zfsbackup list` | Managed published snapshots, event metadata and GUIDs |
+| `/zfsbackup rollback <snapshot>` | Submit a one-click offline rollback through the configured agent/Crafty integration |
+| `/zfsbackup rollback status` | Current or most recent rollback job |
 
-A matching `SNAPSHOT_READY` restores the captured flags before publishing `COMMIT`. Only matching `COMMITTED` records a success and schedules the next normal interval. Unrelated responses are ignored until the deadline. Failures, malformed messages, timeout and shutdown restore saving, attempt `CANCEL`, and defer retries by at least 60 seconds. A late asynchronous callback cannot revive a cancelled request. A running optional FTB `BackupHandler.isRunning()` defers the checkpoint; a present but incompatible optional integration fails closed.
+Running-server commands return immediately and deliver completed responses on the server thread. A rollback response is an accepted background job, not completion: the host agent handles stopping the server, verifying offline state and the world lock, recording recovery points, restoring the existing world dataset, then restarting through Crafty. Job progress remains available after restart. The mod also queries the latest job on each startup.
 
-Saving flags are changed on the server thread, including partial-freeze failures. Forced Minecraft flushing and installed mods' synchronous save hooks can delay a server tick; no mod can safely interrupt disk I/O or restore flags while the server thread is blocked. Once the thread resumes, the elapsed deadline prevents requesting a snapshot after the freeze budget. Ticks continue while waiting for asynchronous barriers or host acknowledgements. Reflection integration and full startup/world behavior still need validation on a separate disposable Minecraft server before deployment.
+Manual checkpoints cannot overlap another checkpoint or bypass the minimum 60-second failure/defer backoff. The host separately enforces its acceptance policy. Automatic scheduling starts after a full interval. An idle skip schedules the next interval. Login and ticks with online players advance an activity generation. Only matching `COMMITTED` clears the generation captured at checkpoint start; failed operations and activity during an in-flight checkpoint remain pending, including after the last player leaves. Activity tracking starts fresh when the server process starts.
 
-Heartbeat and response reads run on two dedicated daemon workers, with one recurring task per file and no per-tick task submissions. Server ticks consume only completed cached results. Even a FIFO or a regular-file-to-FIFO replacement cannot block the game thread or prevent timeout restoration. A blocked filesystem read can occupy its dedicated worker until process exit; it cannot spawn replacement readers. Such an obstruction may make the bridge unavailable until a server restart, while saving remains enabled after the checkpoint timeout. Shutdown interrupts the workers without waiting for an uninterruptible filesystem call.
+## Save and HTTP lifecycle
 
-Transport reads are capped at 16 KiB and reject malformed UTF-8, lenient JSON syntax, duplicate fields, incorrect scalar types, unsupported protocol versions and noncanonical UUIDs. Publication uses a forced temporary file plus an atomic same-directory rename. The mailbox must reside on a filesystem supporting atomic replacement.
+The server thread starts an asynchronous `POST /v1/checkpoints` with `periodic_save` or `manual_save`. Saving stays enabled until a matching `PREPARED`. The mod then rechecks optional FTB backup activity, captures every dimension's prior `noSave`, disables saving, and calls `saveEverything(false, true, true)`.
+
+If installed, `local.asyncplayersave.AsyncPlayerSave.backupCheckpoint(MinecraftServer)` is invoked by reflection. Its completion schedules onto the server thread; the running game thread never calls `join` or `get`. A successful barrier sends the snapshot request. A matching `SNAPSHOT_READY` restores all captured saving flags before sending `commit`. Only matching `COMMITTED`, including the same snapshot identity, records success. Commit acknowledgement has a separate bounded wait while saving is enabled.
+
+The entire prepare/save/snapshot budget uses epoch deadlines and a monotonic elapsed-time guard. Preparation errors, HTTP failures, invalid responses, timeouts and shutdown attempt cancellation and restore all captured flags. A late response or barrier cannot revive a cancelled or newer request. Forced Minecraft flushing and synchronous hooks in other mods can still delay a tick; they cannot safely be interrupted. The deadline is checked immediately when control resumes.
+
+HTTP uses Java 21 `HttpClient.sendAsync`, four bounded daemon workers, at most eight requests in flight, and an independent deadline timer. Both response headers and bodies are bounded in time; responses are capped at 16 KiB, UTF-8/JSON is strict, duplicate keys are rejected, and protocol scalar types/UUIDs are validated. This includes slow bodies after headers, which Java's request timeout alone does not reliably cover.
+
+`ServerStartedEvent` sends `server_started` with `backup_requested=false`. `ServerStoppingEvent` first cancels/restores any in-flight checkpoint. At `ServerStoppedEvent`, the mod sends `server_stopped` and requests a shutdown recovery point when `snapshot_on_shutdown` and activity policy permit. The host always records the event and skips automatic snapshot creation during rollback maintenance.
+
+The stopped listener runs at `LOWEST` priority, after normal-priority companion save drains. Only this fully stopped hook may wait for HTTP: the request has a 15-second deadline, and the outer wait is capped at 20 seconds. The HTTP client is then shut down without waiting for running network operations.
+
+The ordering was checked against the actual NeoForge 21.1.251 patched server JAR: `MinecraftServer.runServer` calls `stopServer`, whose normal path flushes/closes `ServerLevel` instances and closes `LevelStorageAccess`, before `ServerLifecycleHooks.handleServerStopped` posts `ServerStoppedEvent`. NeoForge also posts the event on exceptional shutdown paths, so a failure closing a world does not provide the same durability guarantee as an orderly shutdown. Validate the complete modpack on a disposable server before deployment; forced process termination cannot deliver an exit event.

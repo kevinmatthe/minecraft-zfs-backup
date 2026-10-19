@@ -4,7 +4,7 @@ plugins {
 }
 
 group = 'local.zfsbackup'
-version = '1.0.0'
+version = '2.0.0'
 java.toolchain.languageVersion = JavaLanguageVersion.of(21)
 
 neoForge {
@@ -15,7 +15,7 @@ neoForge {
 }
 
 // Dependency-free executable tests also run in the portable supplied-libraries build.
-['ActivityTest', 'AsyncMailboxTest', 'CheckpointTest', 'MailboxTest', 'SavingGuardTest'].each { testClass ->
+['ActivityTest', 'AgentClientTest', 'AgentViewTest', 'CheckpointTest', 'SavingGuardTest'].each { testClass ->
     def testTask = tasks.register(testClass, JavaExec) {
         dependsOn testClasses
         classpath = sourceSets.test.runtimeClasspath

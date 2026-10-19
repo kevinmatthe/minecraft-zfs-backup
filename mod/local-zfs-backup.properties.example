@@ -1,10 +1,14 @@
-# Copy to the dedicated server's config/local-zfs-backup.properties before startup.
+# Copy to dedicated-server config/local-zfs-backup.properties before startup.
+# Private Docker-network HTTP origin; no host port publication is needed.
+agent_url=http://minecraft-zfs-agent:8765
+# Regular file containing >=32 printable non-space ASCII characters. Never put tokens here.
+# Relative paths resolve from server root; administrator-owned absolute paths are also allowed.
+agent_token_file=config/local-zfs-backup.token
 interval_seconds=3600
-# Automatic checkpoints need player activity since the last successful checkpoint.
-# Activity after the last player leaves remains pending; manual commands bypass this gate.
-only_if_players_been_online=true
-# Includes forced flush, optional asynchronous save barriers and host acknowledgement.
-# Maximum allowed value is 15. Forced disk I/O itself cannot be interrupted safely.
+# Total prepare + forced flush + optional asynchronous save barrier + snapshot response budget.
 freeze_timeout_seconds=15
-# Relative to server root; operator commands cannot change this path.
-bridge_directory=.zfs-snapshot-bridge
+# Manual /zfsbackup save bypasses the idle gate; activity survives the last player's departure.
+only_if_players_been_online=true
+# Send server_stopped after world close, requesting a snapshot according to the activity policy.
+# The host records the event but skips its snapshot during rollback maintenance.
+snapshot_on_shutdown=true

@@ -1,34 +1,44 @@
 package local.zfsbackup;
 
+import com.mojang.brigadier.arguments.StringArgumentType;
+import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
-import net.neoforged.fml.common.Mod;
 import net.neoforged.api.distmarker.Dist;
+import net.neoforged.bus.api.EventPriority;
+import net.neoforged.fml.common.Mod;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.RegisterCommandsEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
 import net.neoforged.neoforge.event.server.ServerStartedEvent;
+import net.neoforged.neoforge.event.server.ServerStoppedEvent;
 import net.neoforged.neoforge.event.server.ServerStoppingEvent;
 import net.neoforged.neoforge.event.tick.ServerTickEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import java.io.*;
+import java.net.URI;
 import java.nio.file.*;
-import java.util.Properties;
+import java.util.*;
 import java.util.concurrent.*;
+import java.util.function.Function;
 
-/** Dedicated-server adapter: game state is touched only by event/command callbacks and server.execute. */
+/** Dedicated-server adapter. Running gameplay never waits for an HTTP response. */
 @Mod(value="local_zfs_backup",dist=Dist.DEDICATED_SERVER)
 public final class ZfsBackupMod {
  private static final Logger LOG=LoggerFactory.getLogger("ZfsBackup");
  private Checkpoint checkpoint;
- private AsyncMailbox mailbox;
+ private AgentClient client;
+ private boolean snapshotOnShutdown=true;
+
  public ZfsBackupMod(){
   NeoForge.EVENT_BUS.addListener(this::started);
   NeoForge.EVENT_BUS.addListener(this::tick);
   NeoForge.EVENT_BUS.addListener(this::stopping);
+  // Other save integrations normally drain on NORMAL. The stopped event is after world close.
+  NeoForge.EVENT_BUS.addListener(EventPriority.LOWEST,this::stopped);
   NeoForge.EVENT_BUS.addListener(this::commands);
   NeoForge.EVENT_BUS.addListener(this::loggedIn);
  }
@@ -40,56 +50,117 @@ public final class ZfsBackupMod {
    if(Files.exists(config))try(Reader reader=Files.newBufferedReader(config)){properties.load(reader);}
    long interval=Long.parseLong(properties.getProperty("interval_seconds","3600"));
    long timeout=Long.parseLong(properties.getProperty("freeze_timeout_seconds","15"));
-   if(interval<60||interval>31536000||timeout<1||timeout>15)throw new IllegalArgumentException("interval_seconds must be 60..31536000 and freeze_timeout_seconds 1..15");
-   String activitySetting=properties.getProperty("only_if_players_been_online","true").trim();
-   if(!activitySetting.equals("true")&&!activitySetting.equals("false"))throw new IllegalArgumentException("only_if_players_been_online must be true or false");
-   boolean onlyIfPlayersBeenOnline=Boolean.parseBoolean(activitySetting);
-   Path relative=Path.of(properties.getProperty("bridge_directory",".zfs-snapshot-bridge"));
-   Path bridge=root.resolve(relative).normalize();
-   if(relative.isAbsolute()||!bridge.startsWith(root)||bridge.equals(root))throw new IllegalArgumentException("bridge_directory must be below the server root");
-   mailbox=new AsyncMailbox(new Mailbox(bridge));
-   checkpoint=new Checkpoint(new ServerPort(server,mailbox),System::currentTimeMillis,()->System.nanoTime()/1_000_000,interval*1000,timeout*1000,onlyIfPlayersBeenOnline);
-   LOG.info("ZFS checkpoint bridge enabled: interval {}s, maximum freeze {}s",interval,timeout);
-  }catch(Exception e){LOG.error("ZFS bridge disabled: invalid configuration",e);}
+   if(interval<60||interval>31536000||timeout<1||timeout>15)throw new IllegalArgumentException("invalid interval or freeze timeout");
+   boolean onlyIfActive=bool(properties,"only_if_players_been_online",true);
+   snapshotOnShutdown=bool(properties,"snapshot_on_shutdown",true);
+   URI url=URI.create(properties.getProperty("agent_url","http://minecraft-zfs-agent:8765"));
+   Path token=root.resolve(properties.getProperty("agent_token_file","config/local-zfs-backup.token")).normalize();
+   client=new AgentClient(url,token);
+   checkpoint=new Checkpoint(new ServerPort(server,client),System::currentTimeMillis,()->System.nanoTime()/1_000_000,interval*1000,timeout*1000,onlyIfActive);
+   LOG.info("HTTP ZFS bridge enabled: interval {}s, checkpoint budget {}s, shutdown snapshot {}",interval,timeout,snapshotOnShutdown);
+   client.lifecycle(AgentClient.LifecycleEvent.SERVER_STARTED,false,UUID.randomUUID(),System.currentTimeMillis()).whenComplete((reply,error)->{
+    if(error==null)LOG.info("Server-started lifecycle event recorded");else LOG.warn("Server-started lifecycle event failed: {}",diagnostic(error));
+   });
+   client.get("/v1/rollbacks/current").whenComplete((job,error)->{
+    if(error==null)LOG.info("Latest {}",AgentView.rollback(job));
+   });
+  }catch(Exception error){
+   if(client!=null){client.close();client=null;}checkpoint=null;
+   // Exceptions from URI/auth machinery may contain administrator values; never print them.
+   LOG.error("HTTP ZFS bridge disabled: check agent URL, regular token file and configuration values");
+  }
+ }
+ private static boolean bool(Properties properties,String key,boolean fallback){
+  String value=properties.getProperty(key,Boolean.toString(fallback)).trim();
+  if(!value.equals("true")&&!value.equals("false"))throw new IllegalArgumentException("invalid boolean configuration");
+  return Boolean.parseBoolean(value);
  }
  private void loggedIn(PlayerEvent.PlayerLoggedInEvent event){if(checkpoint!=null)checkpoint.playerActivity();}
  private void tick(ServerTickEvent.Post event){
-  if(checkpoint!=null){
-   if(event.getServer().getPlayerCount()>0)checkpoint.playerActivity();
-   checkpoint.tick();
-  }
+  if(checkpoint!=null){if(event.getServer().getPlayerCount()>0)checkpoint.playerActivity();checkpoint.tick();}
  }
  private void stopping(ServerStoppingEvent event){
-  try{if(checkpoint!=null)checkpoint.shutdown();}
-  finally{checkpoint=null;if(mailbox!=null){mailbox.close();mailbox=null;}}
+  if(checkpoint!=null){
+   if(event.getServer().getPlayerCount()>0)checkpoint.playerActivity();
+   checkpoint.shutdown();
+  }
+ }
+ private void stopped(ServerStoppedEvent event){
+  if(client==null)return;
+  try{
+   // Verified in patched NeoForge21.1.251 MinecraftServer.runServer: stopServer() closes
+   // ServerLevels and LevelStorageAccess before handleServerStopped posts this event.
+   // This is the ONLY HTTP wait: gameplay/world saving has already stopped.
+   boolean backup=checkpoint!=null&&checkpoint.wantsShutdownSnapshot(snapshotOnShutdown);
+   Map<String,Object> reply=client.lifecycle(AgentClient.LifecycleEvent.SERVER_STOPPED,backup,UUID.randomUUID(),System.currentTimeMillis()).toCompletableFuture().get(20,TimeUnit.SECONDS);
+   LOG.info("Server-stopped lifecycle event accepted: {}",reply.get("state"));
+  }catch(InterruptedException interrupted){Thread.currentThread().interrupt();LOG.warn("Server-stopped lifecycle wait interrupted");}
+  catch(Exception error){LOG.warn("Server-stopped lifecycle request failed within bounded shutdown wait: {}",diagnostic(error));}
+  finally{client.close();client=null;checkpoint=null;}
  }
  private void commands(RegisterCommandsEvent event){
   event.getDispatcher().register(Commands.literal("zfsbackup").requires(source->source.hasPermission(4))
-   .then(Commands.literal("now").executes(context->{
-    boolean accepted=checkpoint!=null&&checkpoint.now();
-    context.getSource().sendSuccess(()->Component.literal(accepted?"ZFS checkpoint started; use /zfsbackup status to inspect progress.":"Checkpoint deferred or unavailable. "+status()),false);
-    return accepted?1:0;
+   .then(Commands.literal("save").executes(context->save(context.getSource())))
+   .then(Commands.literal("now").executes(context->save(context.getSource())))
+   .then(Commands.literal("status").executes(context->{
+    CommandSourceStack source=context.getSource();message(source,checkpoint==null?"HTTP ZFS bridge unavailable":checkpoint.status());
+    return query(source,"/v1/status",AgentView::status);
    }))
-   .then(Commands.literal("status").executes(context->{context.getSource().sendSuccess(()->Component.literal(status()),false);return 1;})));
+   .then(Commands.literal("list").executes(context->query(context.getSource(),"/v1/snapshots",AgentView::snapshots)))
+   .then(Commands.literal("rollback")
+    .then(Commands.literal("status").executes(context->query(context.getSource(),"/v1/rollbacks/current",AgentView::rollback)))
+    .then(Commands.argument("snapshot",StringArgumentType.word()).executes(context->{
+     CommandSourceStack source=context.getSource();
+     if(client==null){message(source,"HTTP ZFS bridge unavailable");return 0;}
+     String snapshot=StringArgumentType.getString(context,"snapshot");
+     if(!snapshot.matches("mc-hourly-[0-9]{8}T[0-9]{6}Z")){message(source,"Choose an exact managed snapshot name from /zfsbackup list.");return 0;}
+     UUID id=UUID.randomUUID();
+     message(source,"Rollback requested; the agent will stop this server before restoring the selected world.");
+     complete(source,client.rollback(id,snapshot),AgentView::rollback);return 1;
+    }))));
  }
- private String status(){return checkpoint==null?"ZFS bridge unavailable (check server log/configuration)":checkpoint.status();}
+ private int save(CommandSourceStack source){
+  boolean accepted=checkpoint!=null&&checkpoint.now();
+  message(source,accepted?"Checkpoint requested; preparing with the HTTP agent.":"Checkpoint deferred or bridge unavailable. "+(checkpoint==null?"Check server configuration/logs.":checkpoint.status()));
+  return accepted?1:0;
+ }
+ private int query(CommandSourceStack source,String path,Function<Map<String,Object>,String> format){
+  if(client==null){message(source,"HTTP ZFS bridge unavailable");return 0;}
+  complete(source,client.get(path),format);return 1;
+ }
+ private void complete(CommandSourceStack source,CompletionStage<Map<String,Object>> result,Function<Map<String,Object>,String> format){
+  MinecraftServer server=source.getServer();
+  result.whenComplete((reply,error)->server.execute(()->{
+   if(server.isStopped())return;
+   message(source,error==null?format.apply(reply):diagnostic(error));
+  }));
+ }
+ private static void message(CommandSourceStack source,String text){source.sendSuccess(()->Component.literal(text),false);}
+ private static String diagnostic(Throwable error){
+  for(Throwable cause=error;cause!=null;cause=cause.getCause()){
+   String message=cause.getMessage();
+   if(message!=null&&message.matches("agent returned HTTP [0-9]{3}"))return message;
+  }
+  return "agent unavailable, timed out or returned an invalid response";
+ }
  private static final class ServerPort implements Checkpoint.Port {
-  private final MinecraftServer server;private final AsyncMailbox mailbox;
+  private final MinecraftServer server;private final AgentClient client;
   private final SavingGuard<ServerLevel> guard=new SavingGuard<>(level->level.noSave,(level,value)->level.noSave=value);
-  ServerPort(MinecraftServer server,AsyncMailbox mailbox){this.server=server;this.mailbox=mailbox;}
-  public Checkpoint.Heartbeat heartbeat()throws Exception{return mailbox.heartbeat();}
-  public Checkpoint.Response response()throws Exception{return mailbox.response();}
-  public void publish(Checkpoint.Request request)throws Exception{mailbox.publish(request);}
+  ServerPort(MinecraftServer server,AgentClient client){this.server=server;this.client=client;}
+  public CompletionStage<Checkpoint.Reply> prepare(Checkpoint.Request request){return client.prepare(request);}
+  public CompletionStage<Checkpoint.Reply> snapshot(Checkpoint.Request request,long frozen){return client.snapshot(request,frozen);}
+  public CompletionStage<Checkpoint.Reply> commit(Checkpoint.Request request,long committed){return client.commit(request,committed);}
+  public CompletionStage<?> cancel(Checkpoint.Request request,long cancelled){return client.cancel(request,cancelled);}
   public boolean busy()throws Exception{
    try{return (boolean)Class.forName("net.creeperhost.ftbbackups.BackupHandler").getMethod("isRunning").invoke(null);}
    catch(ClassNotFoundException absent){return false;}
   }
   public void freeze(){guard.freeze(server.getAllLevels());}
-  public void flush(){if(!server.saveEverything(false,true,true))throw new IllegalStateException("Minecraft forced save returned false");}
+  public void flush(){if(!server.saveEverything(false,true,true))throw new IllegalStateException("forced save failed");}
   public CompletionStage<Void> barrier()throws Exception{
    try{
     Object result=Class.forName("local.asyncplayersave.AsyncPlayerSave").getMethod("backupCheckpoint",MinecraftServer.class).invoke(null,server);
-    if(!(result instanceof CompletionStage<?> stage))throw new IllegalStateException("AsyncPlayerSave backupCheckpoint did not return CompletionStage");
+    if(!(result instanceof CompletionStage<?> stage))throw new IllegalStateException("incompatible asynchronous save integration");
     return stage.thenApply(ignored->null);
    }catch(ClassNotFoundException absent){return CompletableFuture.completedFuture(null);}
   }

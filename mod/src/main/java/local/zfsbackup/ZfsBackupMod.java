@@ -7,6 +7,7 @@ import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.EventPriority;
 import net.neoforged.fml.common.Mod;
@@ -134,7 +135,13 @@ public final class ZfsBackupMod {
      if(!SnapshotNames.isPublished(snapshot)){message(source,"Choose an exact managed snapshot name from /zfsbackup list.");return 0;}
      UUID id=UUID.randomUUID();
      message(source,"Rollback requested; the agent will stop this server before restoring the selected world.");
-     complete(source,client.rollback(id,snapshot),AgentView::rollback);return 1;
+     // Capture the actual command executor on this server thread; identity is never a chat argument.
+     Map<String,Object> actor;
+     if(source.getEntity() instanceof ServerPlayer player){
+      String name=player.getGameProfile().getName();
+      actor=Map.of("kind","player","name",name==null||name.isBlank()?source.getTextName():name,"uuid",player.getUUID().toString());
+     }else actor=Map.of("kind","console","name",source.getTextName());
+     complete(source,client.rollback(id,snapshot,actor),AgentView::rollback);return 1;
     }))));
  }
  private int save(CommandSourceStack source){

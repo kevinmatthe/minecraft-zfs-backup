@@ -74,6 +74,14 @@ public final class AgentClientTest {
    String live="mc-live-20261019T060000Z";UUID liveJob=UUID.randomUUID();
    response.set(new String(JsonIO.encode(Map.of("id",liveJob.toString(),"snapshot",live,"phase","INTENT")),StandardCharsets.UTF_8));
    check(client.rollback(liveJob,live).toCompletableFuture().get(3,TimeUnit.SECONDS).get("snapshot").equals(live),"live-family rollback accepted over real HTTP");passed++;
+   UUID playerId=UUID.randomUUID();Map<String,Object> playerActor=Map.of("kind","player","name","TestOperator","uuid",playerId.toString());
+   client.rollback(liveJob,live,playerActor).toCompletableFuture().get(3,TimeUnit.SECONDS);
+   check(playerActor.equals(JsonIO.object(body.get().getBytes(StandardCharsets.UTF_8)).get("actor")),"real HTTP player rollback actor includes trusted name and canonical UUID");passed++;
+   Map<String,Object> consoleActor=Map.of("kind","console","name","Server");
+   client.rollback(liveJob,live,consoleActor).toCompletableFuture().get(3,TimeUnit.SECONDS);
+   check(consoleActor.equals(JsonIO.object(body.get().getBytes(StandardCharsets.UTF_8)).get("actor")),"real HTTP console actor never invents player UUID or human identity");passed++;
+   client.rollback(liveJob,live).toCompletableFuture().get(3,TimeUnit.SECONDS);
+   check(!JsonIO.object(body.get().getBytes(StandardCharsets.UTF_8)).containsKey("actor"),"legacy rollback overload omits optional actor");passed++;
    for(String invalid:List.of("pending-"+live,"foreign-20261019T060000Z",live+"-extra","mc-live-20261019T060000z"))fails(client.rollback(UUID.randomUUID(),invalid),token);
    status.set(200);client.get("/v1/rollbacks/current").toCompletableFuture().get(3,TimeUnit.SECONDS);check(path.get().equals("/v1/rollbacks/current"),"job status on future startup");passed++;
    int quietHits=hits.get();Thread.sleep(250);check(hits.get()==quietHits,"client sends no periodic heartbeat or file polling requests");passed++;

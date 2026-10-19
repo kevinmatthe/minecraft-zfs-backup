@@ -9,7 +9,7 @@ Create a local PUSH replication task with these settings:
 | Source | The dedicated world dataset from agent configuration |
 | Destination | A dedicated backup dataset on the storage pool |
 | Recursive | Disabled for this single-world source |
-| Snapshot selection | Additional naming schema `mc-hourly-%Y%m%dT%H%M%SZ` |
+| Snapshot selection | Additional naming schema `mc-hourly-%Y%m%dT%H%M%SZ` only |
 | Schedule | For example, every five minutes |
 | Destination retention | For example, Custom: 1 week, independently of local retention |
 | Read-only destination | Set |
@@ -18,7 +18,7 @@ Create a local PUSH replication task with these settings:
 
 Verify the installed retention engine's clock handling when names contain UTC timestamps. Some TrueNAS/zettarepl versions compare parsed name times against the local wall clock even when the suffix is Z; an Asia/Shanghai deployment needs eight hours of lifetime compensation to retain seven actual days. Keep such storage-specific compensation in the native task, outside Mod/agent configuration.
 
-Keep the destination unmounted: `mountpoint=none`, `canmount=off`. Exclude `pending-*` snapshots by selecting only the published naming pattern. TrueNAS permits custom destination lifetimes with a naming schema; its name-regex selector only permits Same as Source or None. The equivalent schema preserves existing snapshot names and supports an independent one-week destination history while the agent keeps the latest24 local points. The replication task copies completed recovery points after the game has restored saving; it does not trigger game backups or communicate with the Mod.
+Keep the destination unmounted: `mountpoint=none`, `canmount=off`. Exclude `pending-*` snapshots by selecting only the published naming pattern. TrueNAS permits custom destination lifetimes with a naming schema; its name-regex selector only permits Same as Source or None. The equivalent schema preserves existing snapshot names and supports an independent one-week destination history while the companion independently expires local live snapshots after one hour and hourly snapshots after24 hours. Live snapshots are deliberately not selected for replication. The replication task copies completed recovery points after the game has restored saving; it does not trigger game backups or communicate with the Mod.
 
 If an existing backup destination already contains snapshots, compare its latest snapshot GUID with the corresponding source GUID before adopting it. Keep this destination exclusive to the replication task. Run the native task manually once, then verify matching source and destination GUIDs. Destination retention, scheduling and failure alerts remain visible in TrueNAS.
 

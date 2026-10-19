@@ -1,6 +1,6 @@
 # NeoForge HTTP save checkpoint bridge
 
-Version 2.1.0 is a dedicated-server-only Java 21 mod for Minecraft 1.21.1 / NeoForge 21.1.251. It actively calls the companion's [HTTP API v1](../docs/http-api.md). Shared mailbox IPC from 1.x is removed. The mod never executes ZFS, Docker, shell commands, replication, or dataset selection.
+Version 2.2.0 is a dedicated-server-only Java 21 mod for Minecraft 1.21.1 / NeoForge 21.1.251. It actively calls the companion's [HTTP API v1](../docs/http-api.md). Shared mailbox IPC from 1.x is removed. The mod never executes ZFS, Docker, shell commands, replication, or dataset selection.
 
 ## Build and test
 
@@ -11,7 +11,7 @@ cd mod
 ./gradlew build
 ```
 
-The standard build pins ModDevGradle 2.1.048, NeoForge 21.1.251 and Gradle 8.14.3. The wrapper distribution has a pinned SHA-256. Gradle produces `build/libs/local-zfs-backup-1.21.1-2.1.0.jar`.
+The standard build pins ModDevGradle 2.2.048, NeoForge 21.1.251 and Gradle 8.14.3. The wrapper distribution has a pinned SHA-256. Gradle produces `build/libs/local-zfs-backup-1.21.1-2.2.0.jar`.
 
 The portable builder compiles and tests against existing matching server libraries, without downloading Minecraft dependencies:
 
@@ -25,7 +25,7 @@ Compilation can also run in an existing container. It reads server libraries and
 python3 build.py --container minecraft-test --server-dir /path/to/server --java /path/to/java21/bin/java
 ```
 
-Python 3.11+ is required. The builder invokes the JDK compiler module, puts mapped `*-srg.jar` files before remaining dependencies, runs executable Java tests, and produces `build/local-zfs-backup-1.21.1-2.1.0.jar`. Tests are excluded from the artifact. The test suite covers lifecycle failure/timeouts/stale callbacks, activity generations, dimension saving flags, command rendering, and a real loopback HTTP server with malformed responses, authorization errors, redirects and stalled response bodies. Gradle `check` runs the same tests.
+Python 3.11+ is required. The builder invokes the JDK compiler module, puts mapped `*-srg.jar` files before remaining dependencies, runs executable Java tests, and produces `build/local-zfs-backup-1.21.1-2.2.0.jar`. Tests are excluded from the artifact. The test suite covers lifecycle failure/timeouts/stale callbacks, activity generations, dimension saving flags, command rendering, and a real loopback HTTP server with malformed responses, authorization errors, redirects and stalled response bodies. Gradle `check` runs the same tests.
 
 ## Configuration
 
@@ -53,13 +53,13 @@ All commands require operator permission level 4:
 | `/zfsbackup save` | Force a save checkpoint, bypassing the idle filter |
 | `/zfsbackup now` | Alias for `save` |
 | `/zfsbackup status` | Local checkpoint/activity status and active HTTP agent status |
-| `/zfsbackup list` | Managed published snapshots, event metadata and GUIDs |
+| `/zfsbackup list` | Both local snapshot families, event metadata and GUIDs |
 | `/zfsbackup rollback <snapshot>` | Submit a one-click offline rollback through the configured agent/Crafty integration |
 | `/zfsbackup rollback status` | Current or most recent rollback job |
 
-Running-server commands return immediately and deliver completed responses on the server thread. A rollback response is an accepted background job, not completion: the host agent handles stopping the server, verifying offline state and the world lock, recording recovery points, restoring the existing world dataset, then restarting through Crafty. Snapshot names complete with Tab after `/zfsbackup rollback `, including typed prefixes. Completion fetches only managed published snapshot names asynchronously from the agent; concurrent requests share a lookup and results are cached for 500 milliseconds. It performs no background polling or world operations. A disabled/unavailable agent or malformed response returns no snapshot suggestions, while the `status` subcommand remains available. Job progress remains available after restart. The mod also queries the latest job on each startup.
+Running-server commands return immediately and deliver completed responses on the server thread. A rollback response is an accepted background job, not completion: the host agent handles stopping the server, verifying offline state and the world lock, recording recovery points, restoring the existing world dataset, then restarting through Crafty. Both `mc-live-*` and `mc-hourly-*` local snapshot names complete with Tab after `/zfsbackup rollback `, including typed prefixes. Completion fetches only managed published snapshot names asynchronously from the agent; concurrent requests share a lookup and results are cached for 500 milliseconds. It performs no background polling or world operations. A disabled/unavailable agent or malformed response returns no snapshot suggestions, while the `status` subcommand remains available. Job progress remains available after restart. The mod also queries the latest job on each startup. Rollback requests include the actual command source: a player profile name/UUID or a console label. The companion writes a separate durable audit outside the world, so restoring a snapshot cannot erase its history.
 
-Manual checkpoints cannot overlap another checkpoint or bypass the minimum 60-second failure/defer backoff. The host separately enforces its acceptance policy. Automatic checkpoints follow whole successful vanilla autosave batches, normally about every five minutes at20TPS. There is no second timer or repeated save. If the optional idle filter is enabled, an idle batch is skipped and the next actual autosave is the next opportunity. Login and ticks with online players advance an activity generation. Only matching `COMMITTED` clears the generation captured at checkpoint start; failed operations and activity during an in-flight checkpoint remain pending, including after the last player leaves. Activity tracking starts fresh when the server process starts.
+Manual checkpoints cannot overlap another checkpoint or bypass the minimum 60-second failure/defer backoff. The host separately enforces its acceptance policy. Automatic checkpoints follow whole successful vanilla autosave batches, normally about every five minutes at20TPS. There is no second save timer or repeated world save. Each autosave creates a live snapshot with a one-hour local expiry; the first successful checkpoint of each UTC capture hour also creates a distinct hourly snapshot with a24-hour expiry inside the same barrier. Manual, normal-stop and recovery snapshots use hourly. The companion implements independent per-snapshot expiry, including while the game is stopped. Normal cadence yields about12 live and24 hourly points; manual and held recovery points can add to those numbers. Configure TTLs in the companion, not through chat commands. Optional storage replication selects hourly only. If the optional idle filter is enabled, an idle batch is skipped and the next actual autosave is the next opportunity. Login and ticks with online players advance an activity generation. Only matching `COMMITTED` clears the generation captured at checkpoint start; failed operations and activity during an in-flight checkpoint remain pending, including after the last player leaves. Activity tracking starts fresh when the server process starts.
 
 ## Save and HTTP lifecycle
 

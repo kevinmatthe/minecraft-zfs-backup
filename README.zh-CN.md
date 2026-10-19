@@ -4,7 +4,7 @@
 
 一个服务端 Minecraft Mod：在存档保存完成后生成 ZFS 恢复点，通过独立的 Docker 配套容器执行 ZFS 操作。默认只需本地备份；异地同步和通过 Crafty 一键回滚均可按需接入。
 
-**当前 Mod：** 2.2.0 · **Minecraft：** 1.21.1 · **NeoForge：** 21.1.251 · **Java：** 21
+**当前 Mod：** 2.3.0 · **Minecraft：** 1.21.1 · **NeoForge：** 21.1.251 · **Java：** 21
 
 - [工作方式](#工作方式)
 - [运行要求](#运行要求)
@@ -18,7 +18,7 @@
 
 ## 工作方式
 
-将 Mod JAR 放入服务端的 `mods/` 目录，用 Docker Compose 部署配套容器。Mod 观察原版自动保存，等待受支持的保存队列完成，然后主动调用配套容器的 HTTP API。容器负责创建本地 ZFS 快照和到期清理。
+将 Mod JAR 放入服务端的 `mods/` 目录，用 Docker Compose 部署配套容器。Mod 跟随原版自动保存创建 live 点，并独立调度小时级完整保存。等待受支持的保存队列完成后，主动调用配套容器的 HTTP API。容器负责创建本地 ZFS 快照和到期清理。
 
 ```mermaid
 flowchart LR
@@ -32,12 +32,12 @@ flowchart LR
 | 快照类别 | 创建时机 | 默认本地保留规则 |
 | --- | --- | --- |
 | `mc-live-*` | 每轮成功的原版自动保存完成后；正常 20 TPS 下约每 5 分钟一次 | TTL 1 小时，正常约 12 份 |
-| `mc-hourly-*` | 每个 UTC 小时中，首次成功的自动保存快照同时创建；按捕获开始时的小时分组 | TTL 24 小时，正常约 24 份定期快照 |
+| `mc-hourly-*` | 独立的完整保存调度：启动后建立基线，之后按 UTC 间隔边界执行，默认每小时 | TTL 24 小时，正常约 24 份定期快照 |
 | 手动、正常停服、回滚恢复事件的 `mc-hourly-*` | 对应事件成功时 | TTL 24 小时；恢复保护 hold 可以延长实际保留时间 |
 
-Live 和 hourly 是两份独立的原生 ZFS 快照，各自记录到期时间。同一轮自动保存需要创建两类快照时，共用一次已完成的存档保存屏障，不会再次强制保存世界。等待 HTTP 期间游戏继续运行；捕获期间会暂缓新的后台保存提交，并在完成或失败时恢复原保存标志。手动强制保存和第三方 Mod 的同步保存钩子仍可能耗时。
+Live 和 hourly 是两份独立的原生 ZFS 快照，各自触发并记录到期时间。Live 观察已完成的原版自动保存，不重复保存；hourly 主动强制完整保存、flush 并等待受支持的玩家、区块、实体和 POI 队列完成，即使原版自动保存关闭也会执行。Mod 独立调度器在启动后请求一份完整基线，之后按 UTC 间隔边界执行；live 或手动快照成功不会重置它。到期的 hourly 优先于新的 live 捕获，失败时保留待执行状态并重试。等待 HTTP 期间游戏继续运行；捕获期间会暂缓新的后台保存提交，并在完成或失败时恢复原保存标志。强制完整保存和第三方 Mod 的同步保存钩子仍可能造成短暂卡顿。
 
-默认无人在线也会备份，因此强制加载区块的变化会被纳入。正常停服且确认保存、关闭成功后，可以再创建一份 hourly；强制结束进程无法发送这一退出事件。
+Live 默认无人在线也会备份，因此强制加载区块的变化会被纳入。独立 hourly 始终跳过玩家活动过滤，并在强制保存后恢复原有的禁用保存标志。正常停服且确认保存、关闭成功后，可以再创建一份 hourly；强制结束进程无法发送这一退出事件。
 
 TTL 根据实际 ZFS 创建时间计算，写入快照用户属性。配套容器在启动、提交快照后及独立定时器中执行清理，检查间隔最长约 60 秒。游戏停服后仍继续清理；容器重启后会处理已过期点。重启或修改 TTL 配置不会延长已有快照的绝对期限。真实 hold、回滚维护或快照繁忙可能推迟删除；保留策略按时间执行，并非硬性的份数上限。
 
@@ -82,7 +82,7 @@ cd minecraft-zfs-backup
 (cd mod && ./gradlew build)
 ```
 
-Gradle 构建产物为 `mod/build/libs/local-zfs-backup-1.21.1-2.2.0.jar`。
+Gradle 构建产物为 `mod/build/libs/local-zfs-backup-1.21.1-2.3.0.jar`。
 
 也可以直接使用已有服务端的匹配依赖编译，并运行 Java 检查：
 
@@ -100,14 +100,14 @@ python3 mod/build.py \
   --server-dir /path/to/server/inside/container
 ```
 
-两种便携构建方式的产物均为 `mod/build/local-zfs-backup-1.21.1-2.2.0.jar`。按正常安装 Mod 的方式，将产出的 JAR 放入服务端 `mods/` 目录。本项目的 Compose 文件只负责部署配套容器。
+两种便携构建方式的产物均为 `mod/build/local-zfs-backup-1.21.1-2.3.0.jar`。按正常安装 Mod 的方式，将产出的 JAR 放入服务端 `mods/` 目录。本项目的 Compose 文件只负责部署配套容器。
 
 使用 Gradle 产物时，宿主机安装示例为：
 
 ```sh
 sudo install -m 0644 -o 1000 -g 1000 \
-  mod/build/libs/local-zfs-backup-1.21.1-2.2.0.jar \
-  /srv/minecraft/mods/local-zfs-backup-1.21.1-2.2.0.jar
+  mod/build/libs/local-zfs-backup-1.21.1-2.3.0.jar \
+  /srv/minecraft/mods/local-zfs-backup-1.21.1-2.3.0.jar
 ```
 
 便携构建时，将源文件改为其 `mod/build/` 下的产物路径。
@@ -210,7 +210,7 @@ docker compose --env-file .env -f deploy/compose.example.yaml logs --tail 50 age
 
 Compose 会从本仓库在本机构建配套镜像。默认示例不向宿主机发布 API 端口。只有配套容器获得 `/dev/zfs` 和示例列出的能力；Minecraft 侧按通常方式安装 Mod JAR 和配置。
 
-安装完 Mod 与配置后，启动或正常重启 Minecraft。使用 `/zfsbackup status`、`/zfsbackup save`、`/zfsbackup list` 验证。自动恢复点从下一轮成功的原版自动保存开始生成，不会在安装时补造历史。
+安装完 Mod 与配置后，启动或正常重启 Minecraft。使用 `/zfsbackup status`、`/zfsbackup save`、`/zfsbackup list` 验证。启动后会请求独立完整保存基线；live 随成功的原版自动保存生成。调度器只生成当前恢复点，不补造历史。
 
 ### 游戏直接运行在宿主机时
 
@@ -240,6 +240,7 @@ Mod 配置改为 `agent_url=http://127.0.0.1:8765`，通过宿主机 loopback �
 agent_url=http://minecraft-zfs-agent:8765
 agent_token_file=config/local-zfs-backup.token
 freeze_timeout_seconds=15
+hourly_interval_seconds=3600
 only_if_players_been_online=false
 snapshot_on_shutdown=true
 ```
@@ -249,11 +250,12 @@ snapshot_on_shutdown=true
 | `agent_url` | `http://minecraft-zfs-agent:8765` | HTTP(S) origin；不能包含凭据、query、fragment 或非根路径 |
 | `agent_token_file` | `config/local-zfs-backup.token` | 普通 token 文件；相对于服务端根目录，也支持绝对路径 |
 | `freeze_timeout_seconds` | `15` | 准备、保存屏障和快照的总时间预算，整数 `1`–`15` 秒 |
-| `only_if_players_been_online` | `false` | 对自动和正常退出备份启用玩家活动过滤；手动备份不受影响。无人时区块仍变化的场景应保持 `false`。 |
+| `hourly_interval_seconds` | `3600` | 独立完整保存间隔，整数 `60`–`31536000` 秒；启动后先建立基线，之后按 UTC 间隔边界执行。 |
+| `only_if_players_been_online` | `false` | 对 live 和正常退出备份启用玩家活动过滤；独立 hourly 和手动备份不受影响。无人时区块仍变化的场景应保持 `false`。 |
 | `snapshot_on_shutdown` | `true` | 确认保存、关闭成功后请求 hourly 快照，同时遵守活动过滤 |
-| `interval_seconds` | 忽略 | 兼容旧配置；自动快照频率跟随原版自动保存 |
+| `interval_seconds` | 忽略 | 兼容旧配置；live 跟随原版自动保存，完整备份由 `hourly_interval_seconds` 控制 |
 
-修改后重启 Minecraft。布尔值只接受 `true` 或 `false`。Token 至少包含 32 个可打印、非空白 ASCII 字符。TTL 在配套容器中配置，与存档保存频率分别控制。
+修改后重启 Minecraft。布尔值只接受 `true` 或 `false`。Token 至少包含 32 个可打印、非空白 ASCII 字符。TTL 在配套容器中配置，与存档保存频率分别控制。小时计时使用单调时钟期限，只有确认 hourly 提交成功才推进；失败时到期任务在退避后继续重试。游戏主线程卡死或存储失败时无法完成强制保存备份。
 
 ### 配套容器：`agent.json`
 
@@ -265,7 +267,7 @@ snapshot_on_shutdown=true
 | `api_token_file` | 必填 | 世界恢复范围之外的私有 API token 绝对路径 |
 | `live_ttl_seconds` | `3600` | Live 寿命；整数 `1`–`315360000` 秒 |
 | `hourly_ttl_seconds` | `86400` | Hourly、手动、正常退出及恢复点寿命；范围同上 |
-| `min_interval_seconds` | `60` | 接受普通快照请求的最小间隔，数值 `0`–`31536000` 秒；不会调度游戏保存 |
+| `min_interval_seconds` | `60` | 普通请求和定时 hourly 各自的最小接受间隔，数值 `0`–`31536000` 秒；近期 live 不会限流 hourly，也不会调度游戏保存 |
 | `listen_host` | `0.0.0.0` | 容器内监听地址 |
 | `listen_port` | `8765` | 整数 `1`–`65535`；修改时同步调整 Mod URL 和可选端口映射 |
 | `crafty` | 无 | 可选的固定 Crafty 接入配置，见下方 |
@@ -388,8 +390,8 @@ docker compose --env-file .env -f deploy/compose.example.yaml exec -T agent \
 | --- | --- |
 | `source_unavailable` 或容器不健康 | `source_dataset` 是否对应实际挂载的宿主机 `world_path`；是否用了符号链接；`level.dat`、`/dev/zfs` 是否存在 |
 | Bridge 被禁用或 HTTP 401 | 两份 token 是否一致；Mod token 是否是可读普通文件；容器 token/配置权限和属性值是否正确 |
-| 没有新自动快照 | 等待完整成功的原版自动保存，检查游戏/容器日志和可选的玩家活动过滤 |
-| 修改 `interval_seconds` 没效果 | 该旧参数已忽略；频率由原版自动保存决定 |
+| 没有新自动快照 | Live 检查原版自动保存；hourly 检查独立调度/重试状态和保存、IO 错误 |
+| 修改 `interval_seconds` 没效果 | 该旧参数已忽略；live 跟随原版自动保存，完整备份由 hourly_interval_seconds 控制 |
 | 超过 12 份 live 或 24 份 hourly | 数量跟随 TTL 和保存节奏；手动、退出、恢复事件、真实 hold 和删除延迟都会影响数量 |
 | 修改 TTL 后旧快照期限未变 | 已记录的绝对期限会保留；新 TTL 用于首次初始化元数据的快照 |
 | 回滚未启用 | 配置 `crafty` 与可写世界 bind；快照功能可独立使用 |

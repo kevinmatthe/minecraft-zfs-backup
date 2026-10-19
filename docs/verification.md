@@ -1,5 +1,14 @@
 # Validation
 
+## Independent complete hourly save, Mod 2.3.0 / companion 2.2.0
+
+- The supplied-library Java21/Minecraft1.21.1/NeoForge21.1.251 build passes142 checks, including19 independent scheduler checks and actual HTTP hourly event transport. Independent specification and quality reviews approved the implementation. The existing autosave observer, native IO barriers, write gates, error tracking and Mixins remain unchanged.
+- Python passes152 checks on the host (two environment skips) and inside the read-only companion image (four environment skips). Independent review also ran32 focused checks. Coverage includes separate acceptance timestamps, exactly one family per new event, and explicit legacy two-member journal fixtures for partial creation/publication, GUID replacement, timeout, cancellation and restart recovery.
+- A disposable full-modpack server used a COW world clone and a60second hourly interval. Without any periodic_save event, startup produced hourly `mc-hourly-20261019T130943Z` (GUID9184711630111309641). After `save-off`, a loaded block at0,200,0 was changed from air to diamond. Independent hourly `mc-hourly-20261019T131000Z` captured that change: reading its immutable Anvil/NBT data returned `minecraft:diamond_block`. Repeating `save-off` reported saving already disabled, verifying restoration of the prior flag. Both points contain exactly one hourly member with86400second expiry. The game then stopped normally, committed its shutdown event and exited0.
+- All disposable containers, their internal network, cloned dataset, three snapshots, copied files and secrets were removed. No production block changes or rollback were used for validation. The final backend differs from the fixture build only in comments; their Python ASTs match, and the deployment image is rebuilt from the committed source.
+
+- Production now runs Mod2.3.0/companion2.2.0 with the original Crafty policies restored and FTB automatic backup disabled. Its startup hourly `mc-hourly-20261019T131336Z` (GUID9246625541314130270) committed independently before any periodic event, with86400second expiry. TrueNAS job22586 succeeded and the target GUID matches; the target contains no live snapshots. The external rollback audit is byte-for-byte unchanged and the protected11am ZIP remains present.
+
 ## Independent live/hourly retention, Mod2.2.0
 
 - The portable builder ran122Java checks against the installed Java21/Minecraft1.21.1/NeoForge21.1.251 libraries. Real HTTP and Brigadier checks cover both local snapshot families, typed-prefix completion, player/console rollback actor requests and legacy API compatibility. Review confirmed the autosave, barrier and write-gate logic is unchanged.

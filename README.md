@@ -4,7 +4,7 @@
 
 A server-side Minecraft Mod that creates ZFS recovery points after completed world saves, with a separate Docker companion for ZFS operations. Start with local backups; add storage replication and Crafty-assisted rollback when needed.
 
-**Current Mod:** 2.2.0 · **Minecraft:** 1.21.1 · **NeoForge:** 21.1.251 · **Java:** 21
+**Current Mod:** 2.3.0 · **Minecraft:** 1.21.1 · **NeoForge:** 21.1.251 · **Java:** 21
 
 - [How it works](#how-it-works)
 - [Requirements](#requirements)
@@ -18,7 +18,7 @@ A server-side Minecraft Mod that creates ZFS recovery points after completed wor
 
 ## How it works
 
-Install the Mod JAR into the server's `mods/` directory. Deploy the companion with Docker Compose. The Mod observes successful native autosaves, waits for the supported save queues, then actively calls the companion's authenticated HTTP API. The companion creates local snapshots and handles their expiry.
+Install the Mod JAR into the server's `mods/` directory. Deploy the companion with Docker Compose. The Mod observes successful native autosaves for live points and independently schedules complete hourly saves. After the supported save queues finish, it actively calls the companion's authenticated HTTP API. The companion creates local snapshots and handles their expiry.
 
 ```mermaid
 flowchart LR
@@ -32,12 +32,12 @@ flowchart LR
 | Snapshot family | Created when | Default local retention |
 | --- | --- | --- |
 | `mc-live-*` | After each successful native autosave, normally about every 5 minutes at 20 TPS | 1 hour, normally about 12 points |
-| `mc-hourly-*` | Alongside the first successful autosave checkpoint in each UTC capture hour | 24 hours, normally about 24 scheduled points |
+| `mc-hourly-*` | Independent full-save scheduler: startup baseline, then UTC interval boundaries (hourly by default) | 24 hours, normally about 24 scheduled points |
 | `mc-hourly-*` for manual, clean-stop and rollback recovery events | When the corresponding event succeeds | 24 hours; recovery holds can extend retention |
 
-Live and hourly are distinct native snapshots with separate expiry times. When both are due, they share one completed-save barrier without forcing another world save. Gameplay continues while HTTP requests are pending; new background save submissions are temporarily gated and saving flags are restored on completion or failure. Manual forced saves and synchronous third-party save hooks can still take time.
+Live and hourly are distinct native snapshots with separate triggers and expiry times. Live observes the completed native autosave without serializing again. Hourly actively forces a complete save and flush, then waits for the supported player/chunk/entity/POI queues, even if native autosave is disabled. An independent Mod scheduler requests a baseline after startup, then uses UTC interval boundaries; successful live/manual checkpoints do not reset that timer. Pending hourly work has priority over a new live capture, and failed hourly work remains due for retry. Gameplay continues while HTTP requests are pending; new background save submissions are temporarily gated and saving flags are restored on completion or failure. Forced full saves and synchronous third-party save hooks can still delay a tick.
 
-Backups run without players by default, including worlds with forced-loaded chunks. A verified clean shutdown can create a final hourly point; forced termination cannot deliver that shutdown event.
+Live backups run without players by default, including worlds with forced-loaded chunks. Independent hourly backups always bypass the player-activity filter and restore prior disabled-saving flags after the forced capture. A verified clean shutdown can create a final hourly point; forced termination cannot deliver that shutdown event.
 
 Expiry is based on actual ZFS creation time and persisted in snapshot user properties. The companion checks expiry on startup, after publication and independently at intervals of at most 60 seconds. It continues cleanup while Minecraft is stopped and resumes overdue cleanup after its own restart. Existing deadlines survive restarts and TTL configuration changes. Holds, rollback maintenance and busy snapshots can delay deletion; retention is by age rather than a hard count.
 
@@ -82,7 +82,7 @@ cd minecraft-zfs-backup
 (cd mod && ./gradlew build)
 ```
 
-The Gradle artifact is `mod/build/libs/local-zfs-backup-1.21.1-2.2.0.jar`.
+The Gradle artifact is `mod/build/libs/local-zfs-backup-1.21.1-2.3.0.jar`.
 
 Alternatively, compile and run the Java checks against an existing server's matching libraries:
 
@@ -100,14 +100,14 @@ python3 mod/build.py \
   --server-dir /path/to/server/inside/container
 ```
 
-Both portable variants output `mod/build/local-zfs-backup-1.21.1-2.2.0.jar`. Install the resulting JAR into the server's `mods/` directory using its normal Mod installation procedure. Only the companion is deployed by this project's Compose file.
+Both portable variants output `mod/build/local-zfs-backup-1.21.1-2.3.0.jar`. Install the resulting JAR into the server's `mods/` directory using its normal Mod installation procedure. Only the companion is deployed by this project's Compose file.
 
 For the Gradle artifact, the example host installation is:
 
 ```sh
 sudo install -m 0644 -o 1000 -g 1000 \
-  mod/build/libs/local-zfs-backup-1.21.1-2.2.0.jar \
-  /srv/minecraft/mods/local-zfs-backup-1.21.1-2.2.0.jar
+  mod/build/libs/local-zfs-backup-1.21.1-2.3.0.jar \
+  /srv/minecraft/mods/local-zfs-backup-1.21.1-2.3.0.jar
 ```
 
 For a portable build, use its `mod/build/` artifact path instead.
@@ -210,7 +210,7 @@ docker compose --env-file .env -f deploy/compose.example.yaml logs --tail 50 age
 
 Compose builds the companion locally. The example publishes no host API port. Only the companion receives `/dev/zfs` and its listed capabilities; Minecraft receives its usual Mod JAR and configuration.
 
-Start or normally restart Minecraft after installing the Mod/configuration. Verify with `/zfsbackup status`, `/zfsbackup save` and `/zfsbackup list`. Automatic points follow the next successful native autosave; installing the Mod does not immediately backfill history.
+Start or normally restart Minecraft after installing the Mod/configuration. Verify with `/zfsbackup status`, `/zfsbackup save` and `/zfsbackup list`. An independent full-save baseline is requested after startup; live points follow successful native autosaves. The scheduler creates current recovery points rather than backfilling history.
 
 ### Minecraft running directly on the host
 
@@ -240,6 +240,7 @@ Set the Mod's `agent_url=http://127.0.0.1:8765`. The API is then reachable throu
 agent_url=http://minecraft-zfs-agent:8765
 agent_token_file=config/local-zfs-backup.token
 freeze_timeout_seconds=15
+hourly_interval_seconds=3600
 only_if_players_been_online=false
 snapshot_on_shutdown=true
 ```
@@ -249,11 +250,12 @@ snapshot_on_shutdown=true
 | `agent_url` | `http://minecraft-zfs-agent:8765` | HTTP(S) origin; no credentials, query, fragment or non-root path |
 | `agent_token_file` | `config/local-zfs-backup.token` | Regular token file; relative to the Minecraft server directory or an absolute path |
 | `freeze_timeout_seconds` | `15` | Total prepare/save-barrier/snapshot budget, integer `1`–`15` seconds |
-| `only_if_players_been_online` | `false` | Apply a player-activity filter to automatic/clean-shutdown backups; manual saves bypass it. Keep `false` for unattended chunk activity. |
+| `hourly_interval_seconds` | `3600` | Independent full-save interval, integer `60`–`31536000` seconds. Startup baseline, then UTC interval boundaries. |
+| `only_if_players_been_online` | `false` | Apply a player-activity filter to live/clean-shutdown backups; independent hourly and manual saves bypass it. Keep `false` for unattended chunk activity. |
 | `snapshot_on_shutdown` | `true` | Request an hourly snapshot after verified successful save/close, subject to the activity filter |
-| `interval_seconds` | ignored | Legacy setting; native autosaves determine automatic checkpoint frequency |
+| `interval_seconds` | ignored | Legacy setting; native autosaves determine live frequency, and `hourly_interval_seconds` controls full backups |
 
-Restart Minecraft after editing these properties. Booleans accept exactly `true` or `false`. Tokens must contain at least 32 printable non-space ASCII characters. TTLs are companion settings, separate from the save interval.
+Restart Minecraft after editing these properties. Booleans accept exactly `true` or `false`. Tokens must contain at least 32 printable non-space ASCII characters. TTLs are companion settings, separate from the save interval. The hourly timer uses monotonic deadlines; only an acknowledged hourly commit advances it. If a checkpoint fails, the due hourly work retries after backoff. A blocked game thread or failed storage cannot provide a successful forced-save backup.
 
 ### Companion: `agent.json`
 
@@ -265,7 +267,7 @@ Restart Minecraft after editing these properties. Booleans accept exactly `true`
 | `api_token_file` | required | Absolute path to the private API token outside the restored world |
 | `live_ttl_seconds` | `3600` | Live snapshot lifetime; integer `1`–`315360000` seconds |
 | `hourly_ttl_seconds` | `86400` | Hourly/manual/clean-stop/recovery lifetime; same range |
-| `min_interval_seconds` | `60` | Minimum accepted normal checkpoint interval; number `0`–`31536000`. Does not schedule world saves. |
+| `min_interval_seconds` | `60` | Minimum accepted interval per normal or scheduled-hourly request class; number `0`–`31536000`. A recent live does not rate-limit hourly. Does not schedule world saves. |
 | `listen_host` | `0.0.0.0` | Companion listen interface inside its container |
 | `listen_port` | `8765` | Integer `1`–`65535`; update the Mod URL and any optional port binding if changed |
 | `crafty` | absent | Optional fixed Crafty integration; see below |
@@ -388,8 +390,8 @@ The private API also provides `GET /healthz` (readiness only, no token), `GET /v
 | --- | --- |
 | `source_unavailable` / unhealthy companion | `source_dataset` matches the exact mounted host `world_path`; no symlink alias; `level.dat` exists; `/dev/zfs` is available |
 | Bridge disabled or HTTP 401 | Matching token copies, regular readable Mod token file, private companion token/configuration and valid property values |
-| No new automatic point | Wait for a successful complete native autosave; inspect game/companion logs and the optional player-activity filter |
-| Changing `interval_seconds` has no effect | This legacy property is ignored; Minecraft supplies the autosave cadence |
+| No new automatic point | For live, wait for a successful native autosave; for hourly, inspect its independent scheduler/retry status and save/IO errors |
+| Changing `interval_seconds` has no effect | This legacy property is ignored; native autosave controls live, and hourly_interval_seconds controls full backups |
 | More than 12 live / 24 hourly points | Counts follow TTL and save cadence; manual/stop/recovery events, real holds and delayed deletion can add points |
 | Cleanup did not change old expiry after editing TTL | Existing absolute deadlines are preserved; new TTLs apply when metadata is first initialized |
 | Rollback is disabled | Configure `crafty` and a writable world bind; snapshots work independently |

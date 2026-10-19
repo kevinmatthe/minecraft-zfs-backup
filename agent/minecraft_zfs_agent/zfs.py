@@ -5,9 +5,13 @@ import os
 import re
 import subprocess
 import threading
+import time
 
-OWNED = re.compile(r'mc-hourly-\d{8}T\d{6}Z\Z')
-PENDING = re.compile(r'pending-mc-hourly-\d{8}T\d{6}Z\Z')
+OWNED = re.compile(r'mc-(?:live|hourly)-\d{8}T\d{6}Z\Z')
+PENDING = re.compile(r'pending-mc-(?:live|hourly)-\d{8}T\d{6}Z\Z')
+
+FAMILY='org.minecraft-zfs-backup:family'
+EXPIRES='org.minecraft-zfs-backup:local-expires-at'
 
 
 class ZFSError(RuntimeError):
@@ -53,7 +57,10 @@ class ZFS:
 
     def snapshot(self, name):
         if not (PENDING.fullmatch(name) or OWNED.fullmatch(name)): raise ValueError('invalid managed snapshot name')
-        self.run('snapshot',self.config.source_dataset+'@'+name,timeout=10)
+        family='live' if name.removeprefix('pending-').startswith('mc-live-') else 'hourly'
+        # Zero is an initialization marker: a crash here is repaired from ZFS creation.
+        self.run('snapshot','-o',FAMILY+'='+family,'-o',EXPIRES+'=0',self.config.source_dataset+'@'+name,timeout=10)
+        self.metadata(name)
 
     def rename(self, old, new):
         if not PENDING.fullmatch(old) or not OWNED.fullmatch(new) or old != 'pending-'+new:
@@ -65,28 +72,49 @@ class ZFS:
         if name in dict(self.snapshots()):
             self.run('destroy',self.config.source_dataset+'@'+name)
 
-    def prune(self):
-        owned=[name for name,_ in self.snapshots() if OWNED.fullmatch(name)]
-        result={'deleted':[], 'held':[]}
-        for name in owned[:-self.config.keep]:
-            if self.stop.is_set(): raise InterruptedError('shutdown requested before retention')
+    def metadata(self,name):
+        if not (OWNED.fullmatch(name) or PENDING.fullmatch(name)):raise ValueError('invalid managed snapshot name')
+        full=self.config.source_dataset+'@'+name
+        raw=self.run('get','-H','-p','-o','value','creation,'+FAMILY+','+EXPIRES,full)
+        values=raw.split()
+        if len(values)!=3:raise RuntimeError('invalid snapshot metadata')
+        created=int(values[0]);family='live' if name.removeprefix('pending-').startswith('mc-live-') else 'hourly'
+        if values[1] not in ('-',family):raise RuntimeError('snapshot family property conflicts with name')
+        expiry=values[2]
+        if expiry in ('-','0'):
+            expiry=created+getattr(self.config,family+'_ttl_seconds')
+            self.run('set',FAMILY+'='+family,EXPIRES+'='+str(expiry),full)
+        else:
+            expiry=int(expiry)
+            if expiry<=created:raise RuntimeError('invalid persisted snapshot expiry')
+        return dict(family=family,created_at=created,expires_at=int(expiry))
+
+    def prune(self,now=None,protected=()):
+        now=time.time() if now is None else now
+        result={'deleted':[], 'held':[], 'next_expiry':None}
+        for name,guid in self.snapshots():
+            if not OWNED.fullmatch(name) or name in protected:continue
+            metadata=self.metadata(name);expiry=metadata['expires_at']
+            if expiry>now:
+                result['next_expiry']=min(result['next_expiry'] or expiry,expiry)
+                continue
+            if self.stop.is_set():raise InterruptedError('shutdown requested before retention')
             full=self.config.source_dataset+'@'+name
             if self.run('holds','-H',full):
                 result['held'].append(name)
-                logging.info('retained externally held snapshot %s',full)
                 continue
+            # Recheck immediately before single, non-forced destruction.
+            if dict(self.snapshots()).get(name)!=guid:continue
             try:self.run('destroy',full)
             except ZFSError as error:
-                # A native replication task may acquire its hold after the check.
                 busy=any(reason in error.stderr.lower() for reason in
                          ('dataset is busy','snapshot is held','has dependent clones'))
                 if busy or self.run('holds','-H',full):
                     result['held'].append(name)
-                    logging.info('retained busy/held snapshot %s',full)
                     continue
                 raise
             result['deleted'].append(name)
-            logging.info('pruned owned local snapshot %s',full)
+            logging.info('expired owned local snapshot %s',full)
         return result
 
     def list_snapshots(self):return dict(self.snapshots())

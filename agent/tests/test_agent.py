@@ -20,7 +20,7 @@ class FakeZFS:
     def guid(self,name):return self.items[name]
     def hold(self,name,tag):self.tags.setdefault(name,set()).add(tag)
     def release(self,name,tag):self.tags.setdefault(name,set()).discard(tag)
-    def prune(self):self.events.append(('prune',));return {'deleted':[],'held':[]}
+    def prune(self,protected=()):self.events.append(('prune',));return {'deleted':[],'held':[]}
 
 
 class Fixture(unittest.TestCase):

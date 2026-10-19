@@ -53,7 +53,9 @@ class Config:
     world_path:Path
     state_dir:Path
     api_token_file:Path
-    keep:int=24
+    keep:int=24 # Deprecated compatibility field; retention uses per-family TTL only.
+    live_ttl_seconds:int=3600
+    hourly_ttl_seconds:int=86400
     min_interval_seconds:float=60
     listen_host:str='0.0.0.0'
     listen_port:int=8765
@@ -63,6 +65,8 @@ class Config:
         for name in ('world_path','state_dir','api_token_file'):object.__setattr__(self,name,absolute(getattr(self,name)))
         if self.state_dir==self.world_path or self.world_path in self.state_dir.parents:raise ValueError('state must be outside restored world')
         if self.api_token_file==self.world_path or self.world_path in self.api_token_file.parents:raise ValueError('API secret must be outside restored world')
+        for name in ('live_ttl_seconds','hourly_ttl_seconds'):
+            if type(getattr(self,name)) is not int or not 1<=getattr(self,name)<=315360000:raise ValueError('invalid snapshot TTL')
         if type(self.keep) is not int or self.keep<1:raise ValueError('keep must be positive')
         if type(self.min_interval_seconds) not in (int,float) or not math.isfinite(self.min_interval_seconds) or not 0<=self.min_interval_seconds<=31536000:raise ValueError('invalid minimum interval')
         if not isinstance(self.listen_host,str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,255}',self.listen_host):raise ValueError('invalid listen host')

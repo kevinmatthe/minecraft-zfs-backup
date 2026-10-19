@@ -10,11 +10,14 @@ from .zfs import OWNED,PENDING
 from .offline_lock import OfflineWorldLock
 
 
+RETENTION_RETRY_SECONDS=60
+
+
 class CheckpointService:
     def __init__(self,config,backend,clock=None):
         self.config,self.backend,self.clock=config,backend,clock or (lambda:time.time_ns()//1_000_000)
         self.lock=threading.RLock();self.maintenance_owner=None;self.rollback=None
-        self.stop=threading.Event();self._timer=None
+        self.stop=threading.Event();self._timer=None;self._retention_timer=None
         config.state_dir.mkdir(parents=True,exist_ok=True,mode=0o700)
         info=config.state_dir.lstat()
         if config.state_dir.is_symlink() or info.st_uid!=os.geteuid() or info.st_mode&0o077:raise ValueError('state must be agent-owned mode0700')
@@ -23,10 +26,13 @@ class CheckpointService:
         except FileNotFoundError:self.ledger=dict(version=2,active=None,operations={},lifecycle={},recovery={},last_accepted_ms=None,last_success=None,last_error=None)
         if self.ledger.get('version')!=2:raise ValueError('use a new HTTP state directory')
         self._reconcile()
+        self.retention_tick()
     def save(self):atomic_json(self.path,self.ledger,mode=0o600)
     def close(self):
-        self.stop.set()
-        if self._timer:self._timer.cancel()
+        with self.lock:
+            self.stop.set()
+            if self._timer:self._timer.cancel()
+            if self._retention_timer:self._retention_timer.cancel()
     @property
     def active_checkpoint(self):
         return self.ledger['operations'].get(self.ledger['active'])
@@ -51,14 +57,22 @@ class CheckpointService:
     def _timer_expire(self):
         try:self.expire()
         except Exception:logging.exception('checkpoint deadline cleanup failed')
+    def _members(self,op):
+        # Old version2 single-snapshot journals remain valid.
+        return op.get('snapshots') or ([op] if op.get('snapshot') else [])
     def _cleanup(self,op,state):
-        if op.get('snapshot'):
-            name='pending-'+op['snapshot'];actual=dict(self.backend.snapshots()).get(name)
-            if actual is not None and op.get('guid') and actual!=op['guid']:raise APIError(409,'guid_conflict','Pending snapshot GUID changed')
-            self.backend.destroy_pending(name)
-        op.update(state=state,updated_ms=self.clock());self.ledger['active']=None;self.save();self._schedule()
+        members=self._members(op);names=dict(self.backend.snapshots())
+        for member in members:
+            actual=names.get('pending-'+member['snapshot'])
+            if actual is not None and member.get('guid') and actual!=member['guid']:
+                raise APIError(409,'guid_conflict','Pending snapshot GUID changed')
+        for member in members:self.backend.destroy_pending('pending-'+member['snapshot'])
+        op.update(state=state,updated_ms=self.clock())
+        if self.active_checkpoint is op:self.ledger['active']=None
+        self.save();self._schedule()
     def expire(self):
         with self.lock:
+            if self.stop.is_set():return
             active=self.active_checkpoint
             if active and not active.get('publish_intent'):
                 grace=60000 if active['state']=='SNAPSHOT_READY' else 0
@@ -70,10 +84,14 @@ class CheckpointService:
             if active and active.get('publish_intent'):self._publish(active)
             for record in self.ledger['lifecycle'].values():
                 if record.get('publish_intent'):self._publish(record)
+            for record in self.ledger['operations'].values():
+                if record.get('state')=='COMMITTED' and record.get('event')=='periodic_save' and any(m['snapshot'].startswith('mc-hourly-') for m in self._members(record)):
+                    self.ledger['periodic_hour']=max(self.ledger.get('periodic_hour',-1),record.get('snapshot_hour',record['created_ms']//3600000))
+            self.save()
             self.expire()
-            active=self.active_checkpoint;protected='pending-'+active['snapshot'] if active and active.get('snapshot') else None
+            active=self.active_checkpoint;protected={'pending-'+m['snapshot'] for m in self._members(active)} if active else set()
             for name,_ in self.backend.snapshots():
-                if PENDING.fullmatch(name) and name!=protected:self.backend.destroy_pending(name)
+                if PENDING.fullmatch(name) and name not in protected:self.backend.destroy_pending(name)
             if active and active['state']=='SNAPSHOTTING':
                 # No acknowledged frozen barrier survives an interrupted snapshot request.
                 self._cleanup(active,'EXPIRED')
@@ -109,10 +127,10 @@ class CheckpointService:
             op=body|dict(state='PREPARED',updated_ms=self.clock())
             self.ledger['operations'][body['id']]=op;self.ledger['active']=body['id'];self.ledger['last_accepted_ms']=self.clock()
             self._bounded(self.ledger['operations']);self.save();self._schedule();return self._public(op)
-    def _name(self,created):
+    def _name(self,created,family='hourly'):
         names=dict(self.backend.snapshots());stamp=created//1000
         for _ in range(300):
-            name=datetime.fromtimestamp(stamp,timezone.utc).strftime('mc-hourly-%Y%m%dT%H%M%SZ')
+            name=datetime.fromtimestamp(stamp,timezone.utc).strftime('mc-'+family+'-%Y%m%dT%H%M%SZ')
             if name not in names and 'pending-'+name not in names:return name
             stamp+=1
         raise APIError(409,'name_conflict','No checkpoint name available')
@@ -123,20 +141,39 @@ class CheckpointService:
             if op['state']=='EXPIRED':raise APIError(410,'expired','Checkpoint expired')
             if op['state']!='PREPARED' or self.ledger['active']!=id:raise APIError(409,'invalid_state','Checkpoint is not prepared')
             if self.clock()>=op['deadline_ms']:self._cleanup(op,'EXPIRED');raise APIError(410,'expired','Freeze budget expired')
-            self._preflight();op.update(state='SNAPSHOTTING',snapshot=self._name(op['created_ms']),frozen_ms=frozen,updated_ms=self.clock());self.save()
-            self.backend.snapshot('pending-'+op['snapshot']);op['guid']=self.backend.guid('pending-'+op['snapshot']);self.save()
+            self._preflight()
+            families=['live'] if op['event']=='periodic_save' else ['hourly']
+            # The UTC family bucket is the frozen capture/barrier start, not a later rename.
+            captured=self.clock();hour=captured//3600000
+            if op['event']=='periodic_save' and hour>self.ledger.get('periodic_hour',-1):families.append('hourly')
+            members=[dict(snapshot=self._name(captured,family),family=family) for family in families]
+            op.update(state='SNAPSHOTTING',snapshot=members[0]['snapshot'],snapshot_hour=hour,snapshots=members,frozen_ms=frozen,updated_ms=self.clock());self.save()
+            for member in members:
+                if self.clock()>=op['deadline_ms']:self._cleanup(op,'EXPIRED');raise APIError(410,'expired','Snapshot completed after deadline')
+                self.backend.snapshot('pending-'+member['snapshot']);member['guid']=self.backend.guid('pending-'+member['snapshot'])
+                if hasattr(self.backend,'metadata'):member.update(self.backend.metadata('pending-'+member['snapshot']))
+                op['guid']=members[0]['guid'];self.save()
             if self.clock()>=op['deadline_ms']:self._cleanup(op,'EXPIRED');raise APIError(410,'expired','Snapshot completed after deadline')
             op.update(state='SNAPSHOT_READY',updated_ms=self.clock());self.save()
             if self.clock()>=op['deadline_ms']:self._cleanup(op,'EXPIRED');raise APIError(410,'expired','Snapshot acknowledgement budget expired')
             self._schedule();return self._public(op)
+    def _validate_members(self,op,published=False):
+        names=dict(self.backend.snapshots())
+        for member in self._members(op):
+            name=member['snapshot'];pending='pending-'+name;guid=member['guid']
+            if published and names.get(name)==guid:
+                if pending in names:raise APIError(409,'guid_conflict','Ambiguous pending and published names')
+            elif name in names or names.get(pending)!=guid:
+                raise APIError(409,'guid_conflict','Recorded snapshot missing or changed')
+        return names
     def _publish(self,op):
-        names=dict(self.backend.snapshots());name=op['snapshot'];pending='pending-'+name
-        if names.get(name)==op['guid']:
-            if pending in names:raise APIError(409,'guid_conflict','Ambiguous pending and published names')
-        elif name in names:raise APIError(409,'guid_conflict','Published snapshot GUID conflict')
-        elif names.get(pending)==op['guid']:self.backend.rename(pending,name)
-        else:raise APIError(409,'guid_conflict','Recorded pending snapshot missing or changed')
+        names=self._validate_members(op,published=True)
+        for member in self._members(op):
+            name=member['snapshot']
+            if name not in names:self.backend.rename('pending-'+name,name)
         op.update(state='COMMITTED',updated_ms=self.clock());op.pop('publish_intent',None)
+        if op.get('event')=='periodic_save' and any(m['snapshot'].startswith('mc-hourly-') for m in self._members(op)):
+            self.ledger['periodic_hour']=max(self.ledger.get('periodic_hour',-1),op.get('snapshot_hour',op['created_ms']//3600000))
         if self.active_checkpoint is op:self.ledger['active']=None
         self.ledger['last_success']=self._public(op);self.save();self._schedule();self._prune()
     def commit(self,id,body):
@@ -151,7 +188,9 @@ class CheckpointService:
             if op['state']=='EXPIRED':raise APIError(410,'expired','Checkpoint expired')
             if op['state']!='SNAPSHOT_READY' or self.ledger['active']!=id:raise APIError(409,'invalid_state','No ready pending checkpoint')
             self._preflight()
-            if self.backend.guid('pending-'+op['snapshot'])!=op['guid']:raise APIError(409,'guid_conflict','Pending GUID changed')
+            self._validate_members(op)
+            # Blocking mount/GUID checks must not turn a late receipt into a new intent.
+            self._phase_time(op,body,'committed_ms',commit=True)
             op.update(committed_ms=committed,publish_intent=True,state='PUBLISHING',updated_ms=self.clock());self.save();self._publish(op);return self._public(op)
     def cancel(self,id,body):
         with self.lock:
@@ -229,11 +268,28 @@ class CheckpointService:
                 return self._public(record)
             finally:world_lock.__exit__(None,None,None)
 
+    def retention_tick(self):
+        with self.lock:
+            if self.stop.is_set():return
+            if self._retention_timer:self._retention_timer.cancel()
+            delay=RETENTION_RETRY_SECONDS
+            try:
+                result=self._prune()
+                next_expiry=result.get('next_expiry') if result else None
+                if next_expiry is not None:delay=min(delay,max(.05,next_expiry-self.clock()/1000))
+            except Exception:logging.exception('autonomous local TTL cleanup failed; retry scheduled')
+            finally:
+                if not self.stop.is_set():
+                    self._retention_timer=threading.Timer(delay,self.retention_tick)
+                    self._retention_timer.daemon=True;self._retention_timer.start()
     def _prune(self):
         if self.maintenance_owner:return
-        try:result=self.backend.prune();result.update(success=True,updated_ms=self.clock())
+        protected={record['snapshot'] for record in self.ledger['recovery'].values() if record.get('state')=='CREATING'}
+        protected.update(member['snapshot'] for collection in ('operations','lifecycle') for record in self.ledger[collection].values() if record.get('publish_intent') for member in self._members(record))
+        try:result=self.backend.prune(protected=protected);result.update(success=True,updated_ms=self.clock())
         except Exception:result=dict(success=False,updated_ms=self.clock(),error='Local retention failed');logging.exception('local retention failed')
         atomic_json(self.config.state_dir/'retention.json',result,mode=0o600)
+        return result
     def status(self):
         with self.lock:
             self.expire()
@@ -244,7 +300,13 @@ class CheckpointService:
         return result
     def list_snapshots(self):
         with self.lock:
-            metadata={record.get('snapshot'):record.get('event','unknown') for collection in ('operations','lifecycle','recovery') for record in self.ledger[collection].values()}
-            return dict(snapshots=[dict(name=name,guid=guid,event=metadata.get(name,'unknown')) for name,guid in self.backend.snapshots() if OWNED.fullmatch(name)],updated_ms=self.clock())
+            metadata={member['snapshot']:record.get('event','unknown') for collection in ('operations','lifecycle','recovery') for record in self.ledger[collection].values() for member in self._members(record)}
+            entries=[]
+            for name,guid in self.backend.snapshots():
+                if not OWNED.fullmatch(name):continue
+                row=dict(name=name,guid=guid,event=metadata.get(name,'unknown'),family='live' if name.startswith('mc-live-') else 'hourly')
+                if hasattr(self.backend,'metadata'):row.update(self.backend.metadata(name))
+                entries.append(row)
+            return dict(snapshots=entries,updated_ms=self.clock())
 
 Coordinator=CheckpointService

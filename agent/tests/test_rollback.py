@@ -76,6 +76,13 @@ class RollbackTests(unittest.TestCase):
         self.assertEqual(len(self.events),count)
         with self.assertRaises(Exception):m.submit(self.identifier,'mc-hourly-20261019T000000Z')
 
+    def test_local_live_snapshot_is_valid_for_rollback(self):
+        live=NAME.replace('mc-hourly-','mc-live-')
+        self.backend.data={live:'111'}
+        manager=self.manager()
+        self.assertEqual(manager.submit(self.identifier,live)['phase'],'COMPLETED')
+        self.assertEqual((self.world/'level.dat').read_bytes(),b'old')
+
     def test_restore_failure_keeps_policy_disabled_holds_and_prepoint_and_never_starts(self):
         def fail(*_):raise OSError('disk exhausted')
         m=self.manager(restorer=fail);job=m.submit(self.identifier,NAME)

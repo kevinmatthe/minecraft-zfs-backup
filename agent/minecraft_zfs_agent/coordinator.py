@@ -167,10 +167,13 @@ class CheckpointService:
                 raise APIError(409,'guid_conflict','Recorded snapshot missing or changed')
         return names
     def _publish(self,op):
-        names=self._validate_members(op,published=True)
+        self._validate_members(op,published=True)
         for member in self._members(op):
-            name=member['snapshot']
-            if name not in names:self.backend.rename('pending-'+name,name)
+            name=member['snapshot'];names=dict(self.backend.snapshots())
+            if name not in names:
+                if names.get('pending-'+name)!=member['guid']:raise APIError(409,'guid_conflict','Pending GUID changed before rename')
+                self.backend.rename('pending-'+name,name)
+            if self.backend.guid(name)!=member['guid']:raise APIError(409,'guid_conflict','Published GUID changed')
         op.update(state='COMMITTED',updated_ms=self.clock());op.pop('publish_intent',None)
         if op.get('event')=='periodic_save' and any(m['snapshot'].startswith('mc-hourly-') for m in self._members(op)):
             self.ledger['periodic_hour']=max(self.ledger.get('periodic_hour',-1),op.get('snapshot_hour',op['created_ms']//3600000))

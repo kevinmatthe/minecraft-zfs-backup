@@ -159,3 +159,12 @@ class FamilyTests(Fixture):
         ready=self.periodic();self.commit()
         self.assertGreater(self.now//3600000,captured_hour)
         self.assertEqual(ready['snapshot_hour'],captured_hour)
+    def test_guid_change_between_group_renames_cannot_publish_replacement(self):
+        ready=self.periodic();second=ready['snapshots'][1]['snapshot'];original=self.zfs.rename
+        def changed(old,new):
+            original(old,new)
+            self.zfs.items['pending-'+second]='replacement'
+        self.zfs.rename=changed
+        with self.assertRaises(APIError):self.commit()
+        self.assertNotIn(second,self.zfs.items)
+        self.assertEqual(self.zfs.items['pending-'+second],'replacement')

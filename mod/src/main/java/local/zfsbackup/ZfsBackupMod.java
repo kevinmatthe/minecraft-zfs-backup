@@ -1,6 +1,7 @@
 package local.zfsbackup;
 
 import com.mojang.brigadier.arguments.StringArgumentType;
+import com.mojang.brigadier.suggestion.Suggestions;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
@@ -31,6 +32,7 @@ public final class ZfsBackupMod {
  private static final Logger LOG=LoggerFactory.getLogger("ZfsBackup");
  private Checkpoint checkpoint;
  private AgentClient client;
+ private SnapshotSuggestions snapshotSuggestions;
  private boolean snapshotOnShutdown=true;
 
  public ZfsBackupMod(){
@@ -56,6 +58,8 @@ public final class ZfsBackupMod {
    URI url=URI.create(properties.getProperty("agent_url","http://minecraft-zfs-agent:8765"));
    Path token=root.resolve(properties.getProperty("agent_token_file","config/local-zfs-backup.token")).normalize();
    client=new AgentClient(url,token);
+   AgentClient activeClient=client;
+   snapshotSuggestions=new SnapshotSuggestions(()->activeClient.get("/v1/snapshots"),()->System.nanoTime()/1_000_000);
    checkpoint=new Checkpoint(new ServerPort(server,client),System::currentTimeMillis,()->System.nanoTime()/1_000_000,interval*1000,timeout*1000,onlyIfActive);
    LOG.info("HTTP ZFS bridge enabled: interval {}s, checkpoint budget {}s, shutdown snapshot {}",interval,timeout,snapshotOnShutdown);
    client.lifecycle(AgentClient.LifecycleEvent.SERVER_STARTED,false,UUID.randomUUID(),System.currentTimeMillis()).whenComplete((reply,error)->{
@@ -65,7 +69,7 @@ public final class ZfsBackupMod {
     if(error==null)LOG.info("Latest {}",AgentView.rollback(job));
    });
   }catch(Exception error){
-   if(client!=null){client.close();client=null;}checkpoint=null;
+   if(client!=null){client.close();client=null;}checkpoint=null;snapshotSuggestions=null;
    // Exceptions from URI/auth machinery may contain administrator values; never print them.
    LOG.error("HTTP ZFS bridge disabled: check agent URL, regular token file and configuration values");
   }
@@ -98,7 +102,7 @@ public final class ZfsBackupMod {
    LOG.info("Server-stopped lifecycle event accepted: {}",reply.get("state"));
   }catch(InterruptedException interrupted){Thread.currentThread().interrupt();LOG.warn("Server-stopped lifecycle wait interrupted");}
   catch(Exception error){LOG.warn("Server-stopped lifecycle request failed within bounded shutdown wait: {}",diagnostic(error));}
-  finally{client.close();client=null;checkpoint=null;}
+  finally{client.close();client=null;checkpoint=null;snapshotSuggestions=null;}
  }
  private void commands(RegisterCommandsEvent event){
   event.getDispatcher().register(Commands.literal("zfsbackup").requires(source->source.hasPermission(4))
@@ -111,7 +115,10 @@ public final class ZfsBackupMod {
    .then(Commands.literal("list").executes(context->query(context.getSource(),"/v1/snapshots",AgentView::snapshots)))
    .then(Commands.literal("rollback")
     .then(Commands.literal("status").executes(context->query(context.getSource(),"/v1/rollbacks/current",AgentView::rollback)))
-    .then(Commands.argument("snapshot",StringArgumentType.word()).executes(context->{
+    .then(Commands.argument("snapshot",StringArgumentType.word()).suggests((context,builder)->{
+     SnapshotSuggestions suggestions=snapshotSuggestions;
+     return !context.getSource().hasPermission(4)||suggestions==null?Suggestions.empty():suggestions.suggest(builder);
+    }).executes(context->{
      CommandSourceStack source=context.getSource();
      if(client==null){message(source,"HTTP ZFS bridge unavailable");return 0;}
      String snapshot=StringArgumentType.getString(context,"snapshot");

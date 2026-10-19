@@ -8,4 +8,4 @@ The game container does not need ZFS privileges, a Docker socket, or a network b
 
 The world must already have its own mounted ZFS dataset. The mod never creates datasets or requires a remote backup destination. A whole Minecraft service directory, including BlueMap and configuration, can have a separate parent dataset and an independent snapshot policy; this agent coordinates the dedicated world dataset only.
 
-See [mod build and configuration](mod/README.md), [agent configuration](agent/README.md), [service installation](deploy/README.md), and [the protocol](docs/protocol.md). End-to-end validation is in progress; see [the implementation plan](docs/plans/2026-10-19-mod-and-agent.md).
+See [mod build and configuration](mod/README.md), [agent configuration](agent/README.md), [service installation](deploy/README.md), [the protocol](docs/protocol.md), and [validation results and limits](docs/verification.md).

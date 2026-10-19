@@ -182,3 +182,11 @@ class SameIDReconcileTests(Fixture):
         self.assertIsNotNone(self.service.active_checkpoint)
         self.assertIn('pending-'+ready['snapshot'],self.zfs.items)
         self.assertEqual(self.commit()['state'],'COMMITTED')
+
+class HistoryBoundsTests(Fixture):
+    def test_lifecycle_history_is_bounded_when_oldest_id_matches_active_checkpoint(self):
+        self.service.lifecycle(dict(id=self.body['id'],event='server_started',created_ms=self.now,backup_requested=False))
+        self.prepare()
+        for _ in range(256):self.service.lifecycle(dict(id=str(uuid.uuid4()),event='server_started',created_ms=self.now,backup_requested=False))
+        self.assertLessEqual(len(self.service.ledger['lifecycle']),256)
+        self.assertEqual(self.service.active_checkpoint['id'],self.body['id'])

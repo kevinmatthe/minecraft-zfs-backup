@@ -36,7 +36,7 @@ class CheckpointService:
     def _bounded(self,collection):
         while len(collection)>256:
             oldest=next(iter(collection))
-            if oldest==self.ledger['active']:break
+            if collection is self.ledger['operations'] and oldest==self.ledger['active']:break
             del collection[oldest]
     def _preflight(self):
         try:self.backend.preflight()

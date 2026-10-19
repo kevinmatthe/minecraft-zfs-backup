@@ -1,60 +1,9 @@
-# Shared directory protocol v1
+# Protocol
 
-This document is the interface contract between `mod/` and `agent/`. Do not change field names or semantics without updating both sides and tests.
+Version2 uses active authenticated HTTP requests between the Mod and companion container. The complete endpoint, event, timing, idempotency and rollback specification is in [HTTP API v1](http-api.md).
 
-## Location and atomicity
+For a normal checkpoint, the Mod prepares an operation before disabling saving, flushes the world and waits for asynchronous saves, then requests a pending snapshot. It restores the original saving flags before committing publication. Timeouts cancel the operation and restore saving. A pending snapshot is excluded from native replication.
 
-The mod chooses a mailbox directory relative to its server root, default `.zfs-snapshot-bridge`. The host administrator configures the corresponding absolute host path. The host obtains source dataset name, world mount path and state directory only from its own configuration. Message fields never select a dataset or command.
+Server-started and server-stopped events have separate semantics. A stopped-world checkpoint runs after world close, and the companion checks the actual session lock before creating it. Rollback is a durable maintenance operation coordinated through Crafty, with recovery points and offline world locking.
 
-Files: `heartbeat.json` (host writes), `request.json` (mod writes), `response.json` (host writes). Writers publish UTF-8 JSON through a unique temporary file and atomic rename in the same directory. All JSON numbers below are integer Unix epoch milliseconds, except protocol version. UUIDs are canonical lowercase UUID strings.
-
-Host heartbeat, refreshed at least every second:
-
-```json
-{"protocol":1,"updated_ms":1792380000000,"ready":true}
-```
-
-`ready` means this exact source dataset is mounted at the configured world path and the coordinator can accept snapshot requests. Mod must not disable saving unless heartbeat is ready and no older than 5 seconds (allow at most 1 second future clock skew).
-
-## Lifecycle
-
-1. Every configured interval (default 3600 seconds), on the Minecraft server thread, the mod checks fresh host readiness and optional FTB-is-running reflection, preserves each dimension's `noSave` flag, disables automatic world saving, and executes a forced flush. Optional installed `local.asyncplayersave.AsyncPlayerSave.backupCheckpoint(server)` is awaited asynchronously through a completion callback scheduled onto the server thread, never `.join()` on that thread.
-2. Once all save barriers succeed, mod publishes a FROZEN request with a new UUID. Default host acknowledgement timeout is 15 seconds. No interval exceeds a configured maximum freeze bound; failure restores saving and retries after at least 60 seconds.
-
-```json
-{"protocol":1,"id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","phase":"FROZEN","created_ms":1792380000000,"deadline_ms":1792380015000}
-```
-
-3. Host validates exact protocol, UUID, phase and timestamp bounds. It records a root-owned pending ledger BEFORE creating a pending snapshot. It rechecks current matching FROZEN request and deadline after snapshot creation. It sends SNAPSHOT_READY only when the snapshot completed before expiry and the request is still current. Other message IDs cannot cancel, commit or publish that pending snapshot.
-
-```json
-{"protocol":1,"id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","phase":"SNAPSHOT_READY","updated_ms":1792380000250,"snapshot":"mc-hourly-20261019T060000Z"}
-```
-
-4. Mod accepts only matching SNAPSHOT_READY before its deadline. On the server thread it restores the previously captured saving flags BEFORE publishing COMMIT. Mailbox reads run on bounded background workers; the server thread consumes completed responses and continues checking the freeze deadline.
-
-```json
-{"protocol":1,"id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","phase":"COMMIT","created_ms":1792380000000,"deadline_ms":1792380015000,"committed_ms":1792380000300}
-```
-
-5. Host publishes the pending snapshot only after matching COMMIT. `committed_ms` must be between created_ms and deadline_ms and cannot be in the future beyond 1 second; host must receive it within 60 seconds after deadline_ms. Pending ledger must match this id, snapshot and timing. Published names `mc-hourly-YYYYMMDDTHHMMSSZ` are UTC, compatible with existing snapshots. Pending names are `pending-` + published name. A repeated committed request is idempotent.
-
-```json
-{"protocol":1,"id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","phase":"COMMITTED","updated_ms":1792380000400,"snapshot":"mc-hourly-20261019T060000Z"}
-```
-
-6. Host applies local retention after durable COMMIT, retaining the newest 24 managed published snapshots by default. It preserves foreign snapshots and external ZFS holds, and uses individual non-forced, non-recursive destruction. Replication is optional and configured separately through native TrueNAS replication or another administrator-managed task; select only published `mc-hourly-*` snapshots, exclude `pending-*`, configure destination retention there and retain enough local points for the expected replication outage. Real external holds are respected; native TrueNAS hold-pending bookkeeping does not prevent this agent from pruning.
-
-## Failures and restart
-
-Mod restores saving on any save error, stale/mismatched response, timeout, failure to publish COMMIT, or server stopping. It publishes CANCEL when possible; absence of a working host must not leave saving disabled. It can ignore unrelated response IDs while awaiting its own deadline. Timeout covers waiting for the optional asynchronous barrier too; tick continues while waiting.
-
-```json
-{"protocol":1,"id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","phase":"CANCEL","created_ms":1792380000000,"deadline_ms":1792380015000,"cancelled_ms":1792380015000}
-```
-
-Host removes owned unpublished pending snapshots after cancellation, expiry, or a newer request superseding the old one. COMMIT is never accepted without a matching recorded pending snapshot. On host restart it reconciles the persisted pending ledger and current request; it can complete a valid COMMIT, otherwise expire/drop only its own pending snapshot. Replication has no role in this lifecycle.
-
-ERROR responses have matching id, protocol, phase ERROR, updated_ms and an error string. Mod restores saving on a matching error. Malformed/oversized files fail closed; maximum message size 16 KiB. A host policy enforces at least 60 seconds between accepted snapshots. For isolated tests this rate limit may be configured lower.
-
-After a successful acknowledgement, mod schedules next interval. Expose operator-only `/zfsbackup now` and `/zfsbackup status`. Scheduling uses elapsed wall time, not a fixed tick count. A manual trigger cannot overlap an existing checkpoint.
+The former1.x shared-directory protocol is retired. Remove mailbox mounts and `bridge_directory` configuration when upgrading. Durable JSON in the companion's private state directory is an internal crash-recovery journal; it is not a Mod communication channel.

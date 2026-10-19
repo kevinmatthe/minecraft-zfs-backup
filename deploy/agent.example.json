@@ -2,7 +2,7 @@
   "source_dataset": "tank/minecraft-world",
   "world_path": "/srv/minecraft/world",
   "mailbox_path": "/srv/minecraft/.zfs-snapshot-bridge",
-  "state_dir": "/var/lib/minecraft-zfs-agent",
+  "state_dir": "/srv/minecraft-backup/state",
   "keep": 24,
   "poll_seconds": 0.2,
   "min_interval_seconds": 60

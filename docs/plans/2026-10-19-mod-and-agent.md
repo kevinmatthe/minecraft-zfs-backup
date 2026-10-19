@@ -2,9 +2,9 @@
 
 **Goal:** Implement and validate the dedicated Minecraft mod and persistent host agent in this new repository, replacing cron/console orchestration after end-to-end verification.
 
-**Architecture:** NeoForge server lifecycle and tick hooks own backup timing, preserve/restore world saving flags and complete save barriers. An expiring shared-directory protocol lets a host daemon snapshot the fixed world dataset, publish only a matching commit and retain local snapshots. Systemd runs the host daemon, with a TrueNAS POSTINIT installer for reboot persistence.
+**Architecture:** NeoForge server lifecycle and tick hooks own backup timing, preserve/restore world saving flags and complete save barriers. An expiring shared-directory protocol lets a host daemon snapshot the fixed world dataset, publish only a matching commit and retain local snapshots. Docker Compose runs the companion ZFS container with restart=unless-stopped; Storage replication is independently configured in native TrueNAS tasks. No cron jobs, systemd units or boot hooks.
 
-**Tech stack:** Java 21, NeoForge 21.1.251 / MC 1.21.1, Python 3.11 standard library, OpenZFS 2.3, systemd.
+**Tech stack:** Java 21, NeoForge 21.1.251 / MC 1.21.1, Python 3.11 standard library, OpenZFS 2.3, Docker Compose.
 
 This is a newly created isolated repository. Work on the implementation branch; no linked worktree is needed. See `docs/protocol.md` for the frozen message contract.
 
@@ -12,8 +12,8 @@ This is a newly created isolated repository. Work on the implementation branch; 
 - [x] Mod: first write failing pure-Java lifecycle/transport tests, then implement interval scheduling, fresh heartbeat gate, save barriers, matching request/response, commit/cancel, timeout and shutdown restoration. Add metadata and portable build instructions; compile against real server libraries and standard Gradle metadata.
 - [x] Agent: first write failing protocol/backend tests, then implement coordinator/pending ledger, safe local ZFS engine, restart reconciliation, rate limits, and durable CLI config. Test malformed/stale/cancelled requests, GUID replacement, retention and foreign snapshot preservation.
 - [x] Review spec compliance and code quality independently; address material findings and rerun affected tests.
-- [x] Root integration: add unit/service installer and example configs; run real disposable-dataset protocol tests.
+- [x] Deployment integration: provide Dockerfile, Compose example and administrator configuration; verify exact read-only world binds, restricted runtime and disposable protocol lifecycle.
 - [x] Isolated Minecraft integration: use a separate validation server and test dataset; verify loaded mod, native timing, successful world flush/snapshot/commit, actual incremental replication, timeout/host loss restoring saving, server shutdown behavior and restored world content.
-- [ ] Document results and commit implementation. If replacing live orchestration, first run existing safety backup, confirm zero players and save/stop, install tested JAR + daemon config, start/recheck, then disable legacy cron only after the mod has created a verified replicated checkpoint. Preserve the user-selected 11:00 legacy ZIP.
+- [x] Document results and commit implementation. If replacing live orchestration, first run existing safety backup, confirm zero players and save/stop, install tested JAR + daemon config, start/recheck, verify the Docker agent and native replication checkpoint, and remove superseded backup services and cron jobs. Preserve the user-selected 11:00 legacy ZIP.
 
 Repository visibility: public. Do not publish live host paths, account secrets, actual player identities or runtime artifacts in the reusable project.

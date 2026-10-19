@@ -43,7 +43,7 @@ Host heartbeat, refreshed at least every second:
 {"protocol":1,"id":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","phase":"COMMITTED","updated_ms":1792380000400,"snapshot":"mc-hourly-20261019T060000Z"}
 ```
 
-6. Host applies local retention after durable COMMIT, retaining the newest 24 managed published snapshots by default. It preserves foreign snapshots and external ZFS holds, and uses individual non-forced, non-recursive destruction. Replication is optional and configured separately through native TrueNAS replication or another administrator-managed task; select only published `mc-hourly-*` snapshots, exclude `pending-*`, protect the incremental base with holds, and configure destination retention there.
+6. Host applies local retention after durable COMMIT, retaining the newest 24 managed published snapshots by default. It preserves foreign snapshots and external ZFS holds, and uses individual non-forced, non-recursive destruction. Replication is optional and configured separately through native TrueNAS replication or another administrator-managed task; select only published `mc-hourly-*` snapshots, exclude `pending-*`, configure destination retention there and retain enough local points for the expected replication outage. Real external holds are respected; native TrueNAS hold-pending bookkeeping does not prevent this agent from pruning.
 
 ## Failures and restart
 

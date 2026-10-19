@@ -1,28 +1,24 @@
-# Host daemon
+# Docker deployment
 
-The Python agent runs continuously as a systemd service. The game mod supplies backup timing. No cron job or console log parser is used.
+Install the Mod JAR into the Minecraft server's `mods` directory. The companion Docker container runs only the ZFS snapshot agent. The mod schedules checkpoints; the container has no scheduler for creating world snapshots and performs no replication.
 
-Copy `agent.example.json` to a persistent administrator-owned location and set actual dataset names, world mount, shared mailbox and private state directory. Set configuration ownership to root and mode 0600. Do not put local configuration or state in Git.
+Requirements: Linux Docker Compose, a host running OpenZFS 2.3, and an existing dedicated world dataset mounted before the container starts. The host supplies its ZFS kernel module; the image includes userspace tools, Python and findmnt. No host Python installation, cron job, systemd unit or boot hook is installed.
 
-```sh
-sudo python3 deploy/install.py --config /etc/minecraft-zfs-agent.local.json \
-  --game-uid 1000 --game-gid 1000
-```
-
-The installer creates a runtime unit in `/run/systemd/system`, prepares shared/private directories, starts the daemon and confirms systemd active state. Check the mailbox heartbeat to confirm the source dataset is ready; systemd active alone does not prove that a world is mounted.
-
-On TrueNAS, use a persistent config path on a data pool and add `--truenas`. This records a POSTINIT task in TrueNAS's configuration database that recreates the runtime service after reboot. Repeated installation updates the same named task instead of creating duplicates.
-
-On ordinary Linux, copy the rendered unit (`--print`) into your distribution's persistent systemd unit directory and enable it, or arrange an equivalent boot hook. The repository must remain available at its installed absolute path.
+1. Build/download the Mod JAR following [mod instructions](../mod/README.md) and install it into `mods`. Its default mailbox is `.zfs-snapshot-bridge` below the server directory.
+2. Copy `agent.example.json` to a persistent root-owned file, mode `0600`. Set the source dataset, exact host world mount, matching mailbox and private state directory. No destination dataset is required.
+3. Pre-create the mailbox owned by the Minecraft UID/GID, mode `0700`; pre-create the private state directory owned by root, mode `0700`. The example binds deliberately refuse to create missing host paths.
+4. Copy `.env.example` to `.env` and set its four paths to match the JSON configuration. Then run from the repository root:
 
 ```sh
-systemctl status minecraft-zfs-agent
-journalctl -u minecraft-zfs-agent -n 50
-PYTHONPATH=agent python3 -m minecraft_zfs_agent --config /etc/minecraft-zfs-agent.local.json status
+docker compose --env-file .env -f deploy/compose.example.yaml up -d --build
+docker compose --env-file .env -f deploy/compose.example.yaml ps
+docker compose --env-file .env -f deploy/compose.example.yaml logs --tail 50 agent
 ```
 
-Install the server mod separately. Its mailbox path is relative to the Minecraft server directory and must refer to the same directory as the host's `mailbox_path`. The default mod directory is `.zfs-snapshot-bridge`. The mailbox directory must be writable by the game UID; host state and configuration remain administrator-owned.
+For an existing Minecraft Compose project, copy the `agent` service into that project and adjust its build context. Only this companion container receives `/dev/zfs` and `SYS_ADMIN`/`DAC_OVERRIDE`. `DAC_OVERRIDE` permits root to access the game-owned private mailbox with all other capabilities dropped. The game container receives no additional privileges. Neither container needs a Docker socket for this backup protocol. The agent container has no network, a read-only root filesystem, and a small temporary filesystem. Docker's `unless-stopped` policy handles restarts.
 
-Replication is optional and independently configured. See [the standalone synchronization task](replication.md). After verifying its first manual run, pass `--replication-config /absolute/sync.local.json` to the installer to add a separate oneshot service and five-minute systemd timer. The TrueNAS reboot hook preserves this option. Omitting it installs only local snapshots. The replication service name is reserved; use a different `--name` for the snapshot agent.
+Bind the world read-only and retain its exact absolute host path inside the agent container. This lets its mount preflight verify the configured dataset rather than an ordinary directory or the wrong filesystem. Bind the mailbox and private state read-write. Configuration is read-only. The daemon restores its durable ledger after restart; stale readiness prevents the mod from disabling saving.
 
-Validate with a disposable source dataset and a separate test server before adopting an existing world. Preserve an independent recovery point. The default installation requires only local snapshots. Configure optional off-pool replication separately. When replacing an existing replicated setup, disable previous console/cron orchestration only after both a real mod-requested snapshot and its independently configured replication have been verified.
+Check the container is healthy, then use `/zfsbackup now` and `/zfsbackup status` in the server console. The local-only setup is complete once a matching published snapshot exists. Configure optional Storage copies using [TrueNAS replication](replication.md), independently of the Mod and agent.
+
+The supplied image targets OpenZFS 2.3 userspace. A test container using userspace 2.3.9 successfully operated against a 2.3.0 host kernel module. Validate other host versions against a disposable dataset before adopting them.

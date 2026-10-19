@@ -9,6 +9,8 @@
 
 - Production now runs Mod2.3.0/companion2.2.0 with the original Crafty policies restored and FTB automatic backup disabled. Its startup hourly `mc-hourly-20261019T131336Z` (GUID9246625541314130270) committed independently before any periodic event, with86400second expiry. TrueNAS job22586 succeeded and the target GUID matches; the target contains no live snapshots. The external rollback audit is byte-for-byte unchanged and the protected11am ZIP remains present.
 
+- The first natural production autosave after upgrade published only `mc-live-20261019T131837Z` (GUID3929004047757556137) with one live member and3600second expiry. The independent startup hourly remains the sole hourly_save operation, so this live success did not add another hourly point. Operator status after the live commit still reports one hourly success, zero hourly failures and the same22:00 local next-hour deadline.
+
 ## Independent live/hourly retention, Mod2.2.0
 
 - The portable builder ran122Java checks against the installed Java21/Minecraft1.21.1/NeoForge21.1.251 libraries. Real HTTP and Brigadier checks cover both local snapshot families, typed-prefix completion, player/console rollback actor requests and legacy API compatibility. Review confirmed the autosave, barrier and write-gate logic is unchanged.

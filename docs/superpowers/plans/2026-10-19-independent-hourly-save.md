@@ -39,4 +39,4 @@ Files: `README.md`, `README.zh-CN.md`, `mod/README.md`, `mod/local-zfs-backup.pr
 - [x] Prepare a private full-modpack fixture on a COW clone, separate tokens/state/network and a60second hourly interval. Disable saving, change a loaded block, verify independent hourly event and actual saved chunk contents, plus original flag restoration.
 - [x] Record small evidence and remove all fixture resources.
 - [x] Protect and stop production through Crafty, install paired versions, preserve audit/configuration and restore restart policy after startup readiness.
-- [ ] Verify immediate startup hourly/full-save point, a later successful native live point, native TrueNAS hourly-only replication/GUID, protected ZIP and clean working tree. Publish source and final documentation to main.
+- [x] Verify immediate startup hourly/full-save point, a later successful native live point, native TrueNAS hourly-only replication/GUID, protected ZIP and clean working tree. Publish source and final documentation to main.

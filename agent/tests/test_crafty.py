@@ -61,6 +61,48 @@ class CraftyTests(unittest.TestCase):
             self.assertNotIn('secret',str(error.exception).lower())
             self.assertNotIn('SECRET BODY',str(error.exception))
 
+    def test_https_handler_does_not_pass_removed_python313_argument(self):
+        import ssl
+        from minecraft_zfs_agent.crafty import _BoundHTTPSHandler
+        handler=_BoundHTTPSHandler(context=ssl.create_default_context())
+        # Python 3.13 removed both this handler member and the connection kwarg.
+        if hasattr(handler,'_check_hostname'):del handler._check_hostname
+        with patch.object(handler,'do_open',return_value='response') as opened:
+            self.assertEqual(handler.https_open(object()),'response')
+        self.assertNotIn('check_hostname',opened.call_args.kwargs)
+
+    def test_actual_tls_request_uses_configured_context(self):
+        import http.server
+        import ssl
+        import subprocess
+        import threading
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as folder:
+            folder=Path(folder);cert=folder/'cert.pem';key=folder/'key.pem'
+            import os
+            fixture=os.environ.get('CRAFTY_TEST_TLS_FIXTURE')
+            if fixture:
+                cert=Path(fixture)/'cert.pem';key=Path(fixture)/'key.pem'
+            else:
+                subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','1',
+                    '-subj','/CN=localhost','-addext','subjectAltName=DNS:localhost',
+                    '-keyout',str(key),'-out',str(cert)],check=True,capture_output=True)
+            token=folder/'token';token.write_text('test-token-value-that-is-long-enough');token.chmod(0o600)
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def do_GET(this):
+                    body=b'{"status":"ok","data":{"auto_start":false,"crash_detection":false}}'
+                    this.send_response(200);this.send_header('Content-Length',str(len(body)));this.end_headers();this.wfile.write(body)
+                def log_message(this,*_):pass
+            server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
+            context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);context.load_cert_chain(cert,key)
+            server.socket=context.wrap_socket(server.socket,server_side=True)
+            worker=threading.Thread(target=server.serve_forever,kwargs={'poll_interval':0.01},daemon=True);worker.start()
+            try:
+                c=CraftyClient(SimpleNamespace(base_url='https://localhost:'+str(server.server_address[1]),server_id='test',token_file=token,
+                    verify_tls=True,ca_file=cert,stop_timeout_seconds=1,start_timeout_seconds=1))
+                self.assertEqual(c.settings(),{'auto_start':False,'crash_detection':False})
+            finally:server.shutdown();server.server_close();worker.join(1)
+
     def test_slow_drip_headers_and_body_obey_absolute_request_deadline(self):
         import socketserver
         import threading

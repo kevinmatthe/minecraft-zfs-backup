@@ -1,4 +1,6 @@
 import json
+import os
+import shutil
 from pathlib import Path
 import tempfile
 import unittest
@@ -71,6 +73,8 @@ class CraftyTests(unittest.TestCase):
             self.assertEqual(handler.https_open(object()),'response')
         self.assertNotIn('check_hostname',opened.call_args.kwargs)
 
+    @unittest.skipUnless(shutil.which('openssl') or os.environ.get('CRAFTY_TEST_TLS_FIXTURE'),
+                         'TLS fixture needs openssl CLI or prepared certificate files')
     def test_actual_tls_request_uses_configured_context(self):
         import http.server
         import ssl

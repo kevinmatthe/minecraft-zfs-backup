@@ -1,0 +1,57 @@
+name: minecraft-zfs-agent
+services:
+  agent:
+    image: minecraft-zfs-agent:local
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    user: "0:0"
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_ADMIN
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    devices:
+      - /dev/zfs:/dev/zfs:rwm
+    pids_limit: 64
+    stop_grace_period: 45s
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    volumes:
+      - type: bind
+        source: ${AGENT_CONFIG:?Set AGENT_CONFIG to the absolute root-owned JSON file}
+        target: /etc/minecraft-zfs-agent.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WORLD_PATH:?Set WORLD_PATH to the exact dedicated ZFS world mount}
+        target: ${WORLD_PATH:?Set WORLD_PATH to the exact dedicated ZFS world mount}
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${MAILBOX_PATH:?Set MAILBOX_PATH to the mod mailbox host path}
+        target: ${MAILBOX_PATH:?Set MAILBOX_PATH to the mod mailbox host path}
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${STATE_DIR:?Set STATE_DIR to the root-owned mode0700 state directory}
+        target: ${STATE_DIR:?Set STATE_DIR to the root-owned mode0700 state directory}
+        bind:
+          create_host_path: false
+    healthcheck:
+      test:
+        - CMD
+        - /usr/bin/python3
+        - -c
+        - "from minecraft_zfs_agent.config import Config; from minecraft_zfs_agent.daemon import status; raise SystemExit(0 if status(Config.load('/etc/minecraft-zfs-agent.json'))['ready'] else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

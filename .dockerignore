@@ -1,0 +1,7 @@
+**
+!Dockerfile
+!agent/
+!agent/minecraft_zfs_agent/
+!agent/minecraft_zfs_agent/*.py
+**/__pycache__/
+**/*.py[cod]

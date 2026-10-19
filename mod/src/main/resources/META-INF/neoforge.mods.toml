@@ -3,7 +3,7 @@ loaderVersion="[4,)"
 license="MIT"
 [[mods]]
 modId="local_zfs_backup"
-version="2.2.0"
+version="2.3.0"
 displayName="Minecraft ZFS Backup Bridge"
 description='''Server-side bounded save checkpoints for an administrator-managed HTTP ZFS agent.'''
 [[dependencies.local_zfs_backup]]

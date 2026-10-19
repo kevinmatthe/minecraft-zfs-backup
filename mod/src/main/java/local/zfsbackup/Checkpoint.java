@@ -24,6 +24,8 @@ public final class Checkpoint {
  private final boolean onlyIfActive,autosaveDriven;
  private State state=State.IDLE;
  private long due,startedElapsed,commitStartedElapsed,activityGeneration,successfulGeneration,capturedGeneration;
+ private long hourlySuccesses,hourlyFailures,hourlySuccessWall,hourlySuccessElapsed;
+ private boolean hourlyQueued;
  private Request request;
  private boolean savingCaptured,retrying,reuseSavedBatch;
  private String detail="waiting for first interval",snapshot;
@@ -42,14 +44,20 @@ public final class Checkpoint {
   if(state!=State.IDLE){if(expired())fail("checkpoint deadline expired");return;}
   if(autosaveDriven)return;
   if(elapsed.getAsLong()<due)return;
-  if(onlyIfActive&&!dirty()){
-   due=elapsed.getAsLong()+interval;retrying=false;detail="skipped automatic checkpoint: no player activity since last success";
-  }else begin("periodic_save",false);
+  // Compatibility timer mode also represents a complete hourly save, never a live capture.
+  hourly();
  }
  public boolean now(){return begin("manual_save",false);}
+ /** Independent complete save, bypassing the live player-activity filter. */
+ public boolean hourly(){return begin("hourly_save",false);}
+ public void hourlyPending(boolean pending){hourlyQueued=pending;}
+ public long hourlySuccessGeneration(){return hourlySuccesses;}
+ public long hourlyFailureGeneration(){return hourlyFailures;}
+ public long hourlySuccessWallMillis(){return hourlySuccessWall;}
+ public long hourlySuccessElapsedMillis(){return hourlySuccessElapsed;}
  /** Called once on the server thread after a successful complete vanilla save batch. */
  public boolean autosave(){
-  if(!autosaveDriven)return false;
+  if(!autosaveDriven||hourlyQueued)return false;
   if(onlyIfActive&&!dirty()){detail="skipped automatic checkpoint: no player activity since last success";return false;}
   return begin("periodic_save",true);
  }
@@ -95,6 +103,9 @@ public final class Checkpoint {
    commitStartedElapsed=elapsed.getAsLong();state=State.COMMITTING;detail="waiting for COMMITTED";
    await(port.commit(request,clock.getAsLong()),State.COMMITTING,"COMMITTED",committed->{
     if(!snapshot.equals(committed.snapshot())){fail("committed snapshot identity changed");return;}
+    if(request.event().equals("hourly_save")){
+     hourlySuccesses++;hourlySuccessWall=clock.getAsLong();hourlySuccessElapsed=elapsed.getAsLong();
+    }
     successfulGeneration=capturedGeneration;request=null;state=State.IDLE;retrying=false;
     due=elapsed.getAsLong()+interval;detail="last success: "+snapshot;
    });
@@ -126,7 +137,9 @@ public final class Checkpoint {
  private void restore(){if(savingCaptured){port.restore();savingCaptured=false;}}
  private void defer(String reason){due=elapsed.getAsLong()+60000;retrying=true;detail="retry: "+reason;}
  private void fail(String reason){
-  restore();Request cancelled=request;request=null;state=State.IDLE;defer(reason);
+  restore();Request cancelled=request;
+  if(cancelled!=null&&cancelled.event().equals("hourly_save"))hourlyFailures++;
+  request=null;state=State.IDLE;defer(reason);
   if(cancelled!=null)try{port.cancel(cancelled,clock.getAsLong());}catch(Exception ignored){}
  }
  public void playerActivity(){if(state!=State.STOPPED)activityGeneration++;}
@@ -137,5 +150,5 @@ public final class Checkpoint {
   if(request!=null)fail("server stopping");
   restore();state=State.STOPPED;
  }
- public String status(){return state+"; "+detail+"; activity_pending="+dirty()+"; "+(autosaveDriven?"automatic_source=vanilla_autosave":"retry/interval remaining ms="+Math.max(0,due-elapsed.getAsLong()));}
+ public String status(){return state+"; "+detail+"; hourly_pending="+hourlyQueued+"; activity_pending="+dirty()+"; "+(autosaveDriven?"automatic_source=vanilla_autosave":"retry/interval remaining ms="+Math.max(0,due-elapsed.getAsLong()));}
 }

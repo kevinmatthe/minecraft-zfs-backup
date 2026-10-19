@@ -43,6 +43,9 @@ public final class AgentClientTest {
    check(reply.id().equals(id)&&reply.state().equals("PREPARED"),"real HTTP prepare reply");
    check(path.get().equals("/v1/checkpoints")&&auth.get().equals("Bearer "+token),"authenticated endpoint");
    check(body.get().contains("\"event\":\"manual_save\"")&&body.get().contains("\"deadline_ms\":"+(now+15000)),"typed prepare body");passed++;
+   UUID hourlyId=UUID.randomUUID();response.set(prepared.replace(id.toString(),hourlyId.toString()));
+   client.prepare(new Checkpoint.Request(hourlyId,"hourly_save",now,now+15000)).toCompletableFuture().get(3,TimeUnit.SECONDS);
+   check(body.get().contains("\"event\":\"hourly_save\"")&&path.get().equals("/v1/checkpoints"),"independent hourly full-save event sent over real HTTP");passed++;
    response.set(prepared.replace("PREPARED","SNAPSHOT_READY").replace("}",",\"snapshot\":\"mc-hourly-20261019T060000Z\"}"));
    check(client.snapshot(request,now+1).toCompletableFuture().get(3,TimeUnit.SECONDS).state().equals("SNAPSHOT_READY"),"snapshot response");
    check(path.get().endsWith("/"+id+"/snapshot")&&body.get().equals("{\"frozen_ms\":"+(now+1)+"}"),"snapshot endpoint/body");passed++;

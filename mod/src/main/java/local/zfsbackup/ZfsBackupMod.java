@@ -32,6 +32,7 @@ import java.util.function.Function;
 public final class ZfsBackupMod {
  private static final Logger LOG=LoggerFactory.getLogger("ZfsBackup");
  private Checkpoint checkpoint;
+ private HourlyScheduler hourlyScheduler;
  private AgentClient client;
  private ServerPort serverPort;
  private SnapshotSuggestions snapshotSuggestions;
@@ -52,8 +53,10 @@ public final class ZfsBackupMod {
    Path root=server.getServerDirectory().toAbsolutePath().normalize();
    Properties properties=new Properties();Path config=root.resolve("config/local-zfs-backup.properties");
    if(Files.exists(config))try(Reader reader=Files.newBufferedReader(config)){properties.load(reader);}
-   // Retained only as an unused compatibility constructor argument; vanilla owns scheduling.
+   // Natural live captures stay vanilla-driven; the full hourly schedule is independent.
    long interval=3600;
+   long hourlyInterval=Long.parseLong(properties.getProperty("hourly_interval_seconds","3600"));
+   if(hourlyInterval<60||hourlyInterval>31536000)throw new IllegalArgumentException("invalid hourly interval");
    long timeout=Long.parseLong(properties.getProperty("freeze_timeout_seconds","15"));
    if(timeout<1||timeout>15)throw new IllegalArgumentException("invalid freeze timeout");
    boolean onlyIfActive=bool(properties,"only_if_players_been_online",false);
@@ -65,12 +68,17 @@ public final class ZfsBackupMod {
    snapshotSuggestions=new SnapshotSuggestions(()->activeClient.get("/v1/snapshots"),()->System.nanoTime()/1_000_000);
    serverPort=new ServerPort(server,client);
    checkpoint=new Checkpoint(serverPort,System::currentTimeMillis,()->System.nanoTime()/1_000_000,interval*1000,timeout*1000,onlyIfActive,true);
+   hourlyScheduler=new HourlyScheduler(checkpoint,System::currentTimeMillis,()->System.nanoTime()/1_000_000,hourlyInterval*1000,line->{
+    if(line.contains("failed"))LOG.warn("{}",line);else LOG.info("{}",line);
+   });
    AutosaveObserver observer=new AutosaveObserver(AutosaveHooks.errors(),baseline->{
+    // Reconcile the independent due work before allowing a new live capture to take the slot.
+    if(hourlyScheduler!=null)hourlyScheduler.tick();
     serverPort.errorBaseline=baseline;
     if(checkpoint!=null)checkpoint.autosave();
    },()->{if(checkpoint!=null)checkpoint.externalSave();});
    serverPort.observer=observer;AutosaveHooks.attach(server,observer);
-   LOG.info("HTTP ZFS bridge enabled: vanilla autosave completion, checkpoint budget {}s, shutdown snapshot {}; interval_seconds does not schedule saves",timeout,snapshotOnShutdown);
+   LOG.info("HTTP ZFS bridge enabled: vanilla autosave live captures and independent hourly full saves every {}s on UTC boundaries; checkpoint budget {}s, shutdown snapshot {}; legacy interval_seconds remains ignored",hourlyInterval,timeout,snapshotOnShutdown);
    client.lifecycle(AgentClient.LifecycleEvent.SERVER_STARTED,false,UUID.randomUUID(),System.currentTimeMillis()).whenComplete((reply,error)->{
     if(error==null)LOG.info("Server-started lifecycle event recorded");else LOG.warn("Server-started lifecycle event failed: {}",diagnostic(error));
    });
@@ -78,7 +86,7 @@ public final class ZfsBackupMod {
     if(error==null)LOG.info("Latest {}",AgentView.rollback(job));
    });
   }catch(Exception error){
-   if(client!=null){client.close();client=null;}checkpoint=null;serverPort=null;snapshotSuggestions=null;AutosaveHooks.detach(server);
+   if(client!=null){client.close();client=null;}checkpoint=null;hourlyScheduler=null;serverPort=null;snapshotSuggestions=null;AutosaveHooks.detach(server);
    // Exceptions from URI/auth machinery may contain administrator values; never print them.
    LOG.error("HTTP ZFS bridge disabled: check agent URL, regular token file, configuration and native autosave/storage hooks");
   }
@@ -90,9 +98,10 @@ public final class ZfsBackupMod {
  }
  private void loggedIn(PlayerEvent.PlayerLoggedInEvent event){if(checkpoint!=null)checkpoint.playerActivity();}
  private void tick(ServerTickEvent.Post event){
-  if(checkpoint!=null){if(event.getServer().getPlayerCount()>0)checkpoint.playerActivity();checkpoint.tick();}
+  if(checkpoint!=null){if(event.getServer().getPlayerCount()>0)checkpoint.playerActivity();if(hourlyScheduler!=null)hourlyScheduler.tick();checkpoint.tick();}
  }
  private void stopping(ServerStoppingEvent event){
+  if(hourlyScheduler!=null)hourlyScheduler.shutdown();
   if(checkpoint!=null){
    if(event.getServer().getPlayerCount()>0)checkpoint.playerActivity();
    checkpoint.shutdown();
@@ -112,14 +121,14 @@ public final class ZfsBackupMod {
    LOG.info("Server-stopped lifecycle event accepted: {}",reply.get("state"));
   }catch(InterruptedException interrupted){Thread.currentThread().interrupt();LOG.warn("Server-stopped lifecycle wait interrupted");}
   catch(Exception error){LOG.warn("Server-stopped lifecycle request failed within bounded shutdown wait: {}",diagnostic(error));}
-  finally{client.close();client=null;checkpoint=null;serverPort=null;snapshotSuggestions=null;AutosaveHooks.detach(event.getServer());}
+  finally{client.close();client=null;checkpoint=null;hourlyScheduler=null;serverPort=null;snapshotSuggestions=null;AutosaveHooks.detach(event.getServer());}
  }
  private void commands(RegisterCommandsEvent event){
   event.getDispatcher().register(Commands.literal("zfsbackup").requires(source->source.hasPermission(4))
    .then(Commands.literal("save").executes(context->save(context.getSource())))
    .then(Commands.literal("now").executes(context->save(context.getSource())))
    .then(Commands.literal("status").executes(context->{
-    CommandSourceStack source=context.getSource();message(source,checkpoint==null?"HTTP ZFS bridge unavailable":checkpoint.status());
+    CommandSourceStack source=context.getSource();message(source,checkpoint==null?"HTTP ZFS bridge unavailable":checkpoint.status()+"; "+(hourlyScheduler==null?"hourly scheduler unavailable":hourlyScheduler.status()));
     return query(source,"/v1/status",AgentView::status);
    }))
    .then(Commands.literal("list").executes(context->query(context.getSource(),"/v1/snapshots",AgentView::snapshots)))

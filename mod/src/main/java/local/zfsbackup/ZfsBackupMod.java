@@ -23,6 +23,7 @@ import java.util.concurrent.*;
 public final class ZfsBackupMod {
  private static final Logger LOG=LoggerFactory.getLogger("ZfsBackup");
  private Checkpoint checkpoint;
+ private AsyncMailbox mailbox;
  public ZfsBackupMod(){
   NeoForge.EVENT_BUS.addListener(this::started);
   NeoForge.EVENT_BUS.addListener(this::tick);
@@ -41,12 +42,16 @@ public final class ZfsBackupMod {
    Path relative=Path.of(properties.getProperty("bridge_directory",".zfs-snapshot-bridge"));
    Path bridge=root.resolve(relative).normalize();
    if(relative.isAbsolute()||!bridge.startsWith(root)||bridge.equals(root))throw new IllegalArgumentException("bridge_directory must be below the server root");
-   checkpoint=new Checkpoint(new ServerPort(server,new Mailbox(bridge)),System::currentTimeMillis,()->System.nanoTime()/1_000_000,interval*1000,timeout*1000);
+   mailbox=new AsyncMailbox(new Mailbox(bridge));
+   checkpoint=new Checkpoint(new ServerPort(server,mailbox),System::currentTimeMillis,()->System.nanoTime()/1_000_000,interval*1000,timeout*1000);
    LOG.info("ZFS checkpoint bridge enabled: interval {}s, maximum freeze {}s",interval,timeout);
   }catch(Exception e){LOG.error("ZFS bridge disabled: invalid configuration",e);}
  }
  private void tick(ServerTickEvent.Post event){if(checkpoint!=null)checkpoint.tick();}
- private void stopping(ServerStoppingEvent event){if(checkpoint!=null){checkpoint.shutdown();checkpoint=null;}}
+ private void stopping(ServerStoppingEvent event){
+  try{if(checkpoint!=null)checkpoint.shutdown();}
+  finally{checkpoint=null;if(mailbox!=null){mailbox.close();mailbox=null;}}
+ }
  private void commands(RegisterCommandsEvent event){
   event.getDispatcher().register(Commands.literal("zfsbackup").requires(source->source.hasPermission(4))
    .then(Commands.literal("now").executes(context->{
@@ -58,9 +63,9 @@ public final class ZfsBackupMod {
  }
  private String status(){return checkpoint==null?"ZFS bridge unavailable (check server log/configuration)":checkpoint.status();}
  private static final class ServerPort implements Checkpoint.Port {
-  private final MinecraftServer server;private final Mailbox mailbox;
+  private final MinecraftServer server;private final AsyncMailbox mailbox;
   private final SavingGuard<ServerLevel> guard=new SavingGuard<>(level->level.noSave,(level,value)->level.noSave=value);
-  ServerPort(MinecraftServer server,Mailbox mailbox){this.server=server;this.mailbox=mailbox;}
+  ServerPort(MinecraftServer server,AsyncMailbox mailbox){this.server=server;this.mailbox=mailbox;}
   public Checkpoint.Heartbeat heartbeat()throws Exception{return mailbox.heartbeat();}
   public Checkpoint.Response response()throws Exception{return mailbox.response();}
   public void publish(Checkpoint.Request request)throws Exception{mailbox.publish(request);}

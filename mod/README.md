@@ -25,7 +25,7 @@ Alternatively, compilation and tests can run in an existing container. Only a un
 python3 build.py --container minecraft-test --server-dir /path/to/server --java /path/to/java21/bin/java
 ```
 
-Python 3.11+ is required. This build uses `java -m jdk.compiler/com.sun.tools.javac.Main`, putting the mapped `*-srg.jar` before remaining server libraries. It produces `build/local-zfs-backup-1.21.1-1.0.0.jar`, containing production classes and mod metadata, excluding test classes. Both build paths run lifecycle, transport and dimension-saving tests.
+Python 3.11+ is required. This build uses `java -m jdk.compiler/com.sun.tools.javac.Main`, putting the mapped `*-srg.jar` before remaining server libraries. It produces `build/local-zfs-backup-1.21.1-1.0.0.jar`, containing production classes and mod metadata, excluding test classes. Both build paths run lifecycle, transport and dimension-saving tests. Linux builds additionally create real FIFO mailbox paths in temporary directories to verify nonblocking server ticks and timeout restoration.
 
 ## Configuration and commands
 
@@ -44,5 +44,7 @@ On the server thread the mod captures every dimension's `noSave` value, sets all
 A matching `SNAPSHOT_READY` restores the captured flags before publishing `COMMIT`. Only matching `COMMITTED` records a success and schedules the next normal interval. Unrelated responses are ignored until the deadline. Failures, malformed messages, timeout and shutdown restore saving, attempt `CANCEL`, and defer retries by at least 60 seconds. A late asynchronous callback cannot revive a cancelled request. A running optional FTB `BackupHandler.isRunning()` defers the checkpoint; a present but incompatible optional integration fails closed.
 
 Saving flags are changed on the server thread, including partial-freeze failures. Forced Minecraft flushing and installed mods' synchronous save hooks can delay a server tick; no mod can safely interrupt disk I/O or restore flags while the server thread is blocked. Once the thread resumes, the elapsed deadline prevents requesting a snapshot after the freeze budget. Ticks continue while waiting for asynchronous barriers or host acknowledgements. Reflection integration and full startup/world behavior still need validation on a separate disposable Minecraft server before deployment.
+
+Heartbeat and response reads run on two dedicated daemon workers, with one recurring task per file and no per-tick task submissions. Server ticks consume only completed cached results. Even a FIFO or a regular-file-to-FIFO replacement cannot block the game thread or prevent timeout restoration. A blocked filesystem read can occupy its dedicated worker until process exit; it cannot spawn replacement readers. Such an obstruction may make the bridge unavailable until a server restart, while saving remains enabled after the checkpoint timeout. Shutdown interrupts the workers without waiting for an uninterruptible filesystem call.
 
 Transport reads are capped at 16 KiB and reject malformed UTF-8, lenient JSON syntax, duplicate fields, incorrect scalar types, unsupported protocol versions and noncanonical UUIDs. Publication uses a forced temporary file plus an atomic same-directory rename. The mailbox must reside on a filesystem supporting atomic replacement.

@@ -15,7 +15,7 @@ neoForge {
 }
 
 // Dependency-free executable tests also run in the portable supplied-libraries build.
-['CheckpointTest', 'MailboxTest', 'SavingGuardTest'].each { testClass ->
+['AsyncMailboxTest', 'CheckpointTest', 'MailboxTest', 'SavingGuardTest'].each { testClass ->
     def testTask = tasks.register(testClass, JavaExec) {
         dependsOn testClasses
         classpath = sourceSets.test.runtimeClasspath

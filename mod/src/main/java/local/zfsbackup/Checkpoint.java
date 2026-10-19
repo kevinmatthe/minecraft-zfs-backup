@@ -21,34 +21,50 @@ public final class Checkpoint {
  private final Port port;
  private final LongSupplier clock,elapsed;
  private final long interval,timeout;
- private final boolean onlyIfActive;
+ private final boolean onlyIfActive,autosaveDriven;
  private State state=State.IDLE;
  private long due,startedElapsed,commitStartedElapsed,activityGeneration,successfulGeneration,capturedGeneration;
  private Request request;
- private boolean savingCaptured,retrying;
+ private boolean savingCaptured,retrying,reuseSavedBatch;
  private String detail="waiting for first interval",snapshot;
 
  public Checkpoint(Port port,LongSupplier clock,LongSupplier elapsed,long interval,long timeout,boolean onlyIfActive){
+  this(port,clock,elapsed,interval,timeout,onlyIfActive,false);
+ }
+ public Checkpoint(Port port,LongSupplier clock,LongSupplier elapsed,long interval,long timeout,boolean onlyIfActive,boolean autosaveDriven){
   if(interval<60000||timeout<1000||timeout>15000)throw new IllegalArgumentException("interval >=60s; freeze budget 1..15s");
-  this.port=port;this.clock=clock;this.elapsed=elapsed;this.interval=interval;this.timeout=timeout;this.onlyIfActive=onlyIfActive;
+  this.port=port;this.clock=clock;this.elapsed=elapsed;this.interval=interval;this.timeout=timeout;this.onlyIfActive=onlyIfActive;this.autosaveDriven=autosaveDriven;
+  if(autosaveDriven)detail="waiting for completed vanilla autosave";
   due=elapsed.getAsLong()+interval;
  }
  public void tick(){
   if(state==State.STOPPED)return;
   if(state!=State.IDLE){if(expired())fail("checkpoint deadline expired");return;}
+  if(autosaveDriven)return;
   if(elapsed.getAsLong()<due)return;
   if(onlyIfActive&&!dirty()){
    due=elapsed.getAsLong()+interval;retrying=false;detail="skipped automatic checkpoint: no player activity since last success";
-  }else begin("periodic_save");
+  }else begin("periodic_save",false);
  }
- public boolean now(){return begin("manual_save");}
- private boolean begin(String event){
+ public boolean now(){return begin("manual_save",false);}
+ /** Called once on the server thread after a successful complete vanilla save batch. */
+ public boolean autosave(){
+  if(!autosaveDriven)return false;
+  if(onlyIfActive&&!dirty()){detail="skipped automatic checkpoint: no player activity since last success";return false;}
+  return begin("periodic_save",true);
+ }
+ /** An independent forced save must run after cancelling our frozen capture. */
+ public void externalSave(){if(savingCaptured)fail("another world save started");}
+ private boolean begin(String event,boolean savedBatch){
   if(state!=State.IDLE||(retrying&&elapsed.getAsLong()<due))return false;
   try{
    if(port.busy()){defer("FTB backup active");return false;}
    long created=clock.getAsLong();startedElapsed=elapsed.getAsLong();capturedGeneration=activityGeneration;
    request=new Request(UUID.randomUUID(),event,created,created+timeout);
-   state=State.PREPARING;detail="waiting for agent PREPARED";
+   reuseSavedBatch=savedBatch;state=State.PREPARING;detail="waiting for agent PREPARED";
+   // An autosave has already captured its data. Prevent new periodic writes while
+   // HTTP preparation runs, without serializing the world a second time.
+   if(savedBatch){savingCaptured=true;port.freeze();}
    await(port.prepare(request),State.PREPARING,"PREPARED",reply->prepared());
    return true;
   }catch(Exception error){if(request!=null)fail("prepare failed");else defer("readiness check failed");return false;}
@@ -57,8 +73,8 @@ public final class Checkpoint {
   try{
    if(port.busy()){fail("FTB backup became active");return;}
    if(expired()){fail("prepare deadline expired before freezing");return;}
-   state=State.BARRIER;detail="waiting for asynchronous save barrier";savingCaptured=true;
-   port.freeze();port.flush();
+   state=State.BARRIER;detail="waiting for asynchronous save barrier";
+   if(!reuseSavedBatch){savingCaptured=true;port.freeze();port.flush();}
    if(expired()){fail("forced flush exceeded deadline");return;}
    UUID id=request.id();
    port.barrier().whenComplete((ignored,error)->port.execute(()->{
@@ -121,5 +137,5 @@ public final class Checkpoint {
   if(request!=null)fail("server stopping");
   restore();state=State.STOPPED;
  }
- public String status(){return state+"; "+detail+"; activity_pending="+dirty()+"; retry/interval remaining ms="+Math.max(0,due-elapsed.getAsLong());}
+ public String status(){return state+"; "+detail+"; activity_pending="+dirty()+"; "+(autosaveDriven?"automatic_source=vanilla_autosave":"retry/interval remaining ms="+Math.max(0,due-elapsed.getAsLong()));}
 }
